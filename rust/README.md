@@ -123,3 +123,40 @@ started ring (`mem::replace` around the service call) handed the
 controller stack addresses. Capture then sent only zero-length packets.
 The data path state now lives in its own struct, so the service closures
 borrow disjoint fields instead.
+
+## Interrupt budget and fault injection (2026-11-03)
+
+`vendorctl.py isr` reads the USB ISR cycle profile (debug request 0x11,
+DWT cycle counter at 500 MHz). Numbers at 48 kHz:
+
+| Case | ISR mean | ISR max | Load |
+|---|---|---|---|
+| idle (SOF only) | 0.95 us | 2.34 us | 0.65 % |
+| playback + capture | 1.77 us | 4.34 us (completions 3.97) | 2.47 % |
+| ... + 200 codec writes | | 285 us (setup 282) | 4.5 % |
+
+The microframe is 125 us, so streaming uses a few percent. A codec write
+blocks the ISR for about 0.28 ms; during 200 writes the playback lead fell
+from 117 to 106 frames, with 0 underruns. 192 kHz would copy 4 times the
+data per packet. That is an estimate, not measured.
+
+`tools/faults.sh` (host). After each case, the device must come back at
+480M and run a clean 5 s playback + capture with zero counters:
+
+- reset: usbreset in the middle of a stream. ok
+- port: hub port disabled for 1 s, then enabled again, mid-stream. ok
+- suspend: runtime autosuspend while idle (the device reached
+  `suspended`), then resume by opening the stream. ok
+- openclose: 100 short open/close cycles in mixed directions. ok
+- order: capture first, then playback first, then overlapping stops. ok,
+  0 counters
+
+Not covered: SET_CUR rate changes and endpoint halt while streaming.
+usbfs refuses class and endpoint requests to interfaces that snd-usb-audio
+holds. snd-usb-audio does not send halt requests to iso endpoints.
+
+Full speed, forced with the `force-full-speed` feature (PFSC). The LED
+blinks fast, and the kernel logs "not running at top speed". The device
+still returns the high-speed configuration, so snd-usb-audio creates the
+card. Playback "works" with 999 underruns in 3 s. Capture fails with EIO.
+The host gets no clear error: this is open.

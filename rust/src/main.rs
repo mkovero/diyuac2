@@ -16,6 +16,7 @@ mod clock;
 mod codec;
 mod feedback;
 mod fcb;
+mod profile;
 mod serial;
 mod usb;
 

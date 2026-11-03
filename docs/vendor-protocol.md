@@ -55,6 +55,20 @@ Debug requests (0x10 and up) are not part of the protocol and may change:
 | bRequest | Name | Dir | wLength | Data |
 |---|---|---|---|---|
 | 0x10 | DBG_CODEC_WRITE | OUT | 0 | `wValue = reg << 9 \| value` (WM8960: 7-bit register, 9-bit value) |
+| 0x11 | DBG_ISR_STATS | IN | 40 | USB ISR cycle profile, Rust firmware only (below); CLEAR_STATS resets it |
+
+DBG_ISR_STATS data (little endian, cycles of the core clock):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | ISR entries |
+| 4 | 4 | longest ISR |
+| 8 | 4 | longest SOF section (feedback, TX ring zeroing) |
+| 12 | 4 | longest transfer-completion section (EP0 and iso rings) |
+| 16 | 4 | longest SETUP section (includes codec I2C writes) |
+| 20 | 8 | cycles spent in the ISR |
+| 28 | 8 | cycles elapsed since the profile was cleared |
+| 36 | 4 | core clock, Hz |
 
 `vendor_stats_t` (40 bytes, diagnostics for soak tests):
 

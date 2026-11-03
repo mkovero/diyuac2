@@ -12,6 +12,7 @@ use cortex_m::peripheral::NVIC;
 use imxrt_ral as ral;
 
 use crate::audio::Audio;
+use crate::profile::{self, Section};
 use descriptors as desc;
 use hw::{QhList, Td, ep_bit};
 
@@ -143,8 +144,13 @@ pub fn init(serial: &str, audio_setup: impl FnOnce(&mut Audio)) {
     // Interrupt threshold: immediate (default is 8 microframes).
     ral::write_reg!(ral::usb, regs, USBCMD, 0);
     ral::write_reg!(ral::usb, regs, USBMODE, hw::USBMODE_CM_DEVICE | hw::USBMODE_SLOM);
-    // PFSC = 0: allow high-speed chirp.
-    ral::modify_reg!(ral::usb, regs, PORTSC1, |v| v & !(1 << 24));
+    // PFSC = 0: allow high-speed chirp. The `force-full-speed` test build
+    // sets it, to exercise the full-speed path.
+    if cfg!(feature = "force-full-speed") {
+        ral::modify_reg!(ral::usb, regs, PORTSC1, |v| v | (1 << 24));
+    } else {
+        ral::modify_reg!(ral::usb, regs, PORTSC1, |v| v & !(1 << 24));
+    }
     usb.ep0_init();
     ral::write_reg!(ral::usb, regs, ASYNCLISTADDR, &usb.qhs as *const QhList as u32);
     let status = ral::read_reg!(ral::usb, regs, USBSTS);
@@ -203,6 +209,7 @@ impl Usb {
     }
 
     fn isr(&mut self) {
+        let entry = profile::enter();
         let regs = hw::regs();
         let status = ral::read_reg!(ral::usb, regs, USBSTS) & ral::read_reg!(ral::usb, regs, USBINTR);
         ral::write_reg!(ral::usb, regs, USBSTS, status);
@@ -223,9 +230,12 @@ impl Usb {
         if status & hw::USBSTS_SRI != 0 {
             // Every microframe at high speed: feedback measurement and
             // playback ring housekeeping.
+            let t = profile::now();
             self.audio.sof(ral::read_reg!(ral::usb, regs, FRINDEX) & 0x3FFF);
+            profile::section(Section::Sof, t);
         }
         if status & (hw::USBSTS_UI | hw::USBSTS_UEI) != 0 {
+            let t = profile::now();
             let complete = ral::read_reg!(ral::usb, regs, ENDPTCOMPLETE);
             ral::write_reg!(ral::usb, regs, ENDPTCOMPLETE, complete);
             if complete & (ep_bit(0, false) | ep_bit(0, true)) != 0 {
@@ -234,10 +244,14 @@ impl Usb {
             if self.configured {
                 self.audio.service(&mut self.qhs);
             }
+            profile::section(Section::Xfer, t);
             if ral::read_reg!(ral::usb, regs, ENDPTSETUPSTAT) & 1 != 0 {
+                let t = profile::now();
                 self.setup();
+                profile::section(Section::Setup, t);
             }
         }
+        profile::exit(entry);
     }
 
     fn update_link(&self) {

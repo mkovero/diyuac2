@@ -38,6 +38,7 @@ const VREQ_SET_SCRATCH: u8 = 0x02;
 const VREQ_GET_STATS: u8 = 0x03;
 const VREQ_CLEAR_STATS: u8 = 0x04;
 const VREQ_DBG_CODEC_WRITE: u8 = 0x10;
+const VREQ_DBG_ISR_STATS: u8 = 0x11;
 
 const SCRATCH_SIZE: usize = 32;
 
@@ -478,6 +479,7 @@ impl Audio {
             }
             (VREQ_CLEAR_STATS, false) if req.length == 0 => {
                 self.path.stats = Stats::new();
+                crate::profile::clear();
                 Reply::Ack
             }
             // Debug. Blocks the USB ISR for the I2C transfer (~0.3 ms).
@@ -487,6 +489,10 @@ impl Audio {
                     .as_mut()
                     .is_some_and(|c| c.write_reg(req.value >> 9, req.value & 0x1FF));
                 if ok { Reply::Ack } else { Reply::Stall }
+            }
+            (VREQ_DBG_ISR_STATS, true) => {
+                crate::profile::bytes(&mut buf[..crate::profile::BYTES]);
+                Reply::In(crate::profile::BYTES)
             }
             _ => Reply::Stall,
         }

@@ -11,6 +11,7 @@ Needs write access to the device node (root, or a udev rule, see docs/vendor-pro
   vendorctl.py stats [interval_s]     # once, or repeatedly
   vendorctl.py clear-stats
   vendorctl.py codec-write <reg> <val>  # debug, WM8960: 7-bit reg, 9-bit value (hex ok)
+  vendorctl.py isr [interval_s]       # debug: USB ISR cycle profile (clear-stats resets it)
 """
 
 import ctypes
@@ -29,6 +30,7 @@ VREQ_SET_SCRATCH = 0x02
 VREQ_GET_STATS = 0x03
 VREQ_CLEAR_STATS = 0x04
 VREQ_DBG_CODEC_WRITE = 0x10
+VREQ_DBG_ISR_STATS = 0x11
 SCRATCH_SIZE = 32
 
 STATS_FMT = "<9I2H"  # vendor_stats_t, 40 bytes
@@ -152,6 +154,21 @@ def main():
                 sys.exit("reg <= 0x7f, val <= 0x1ff")
             control(fd, RT_OUT, VREQ_DBG_CODEC_WRITE, value=(reg << 9) | val)
             print(f"R{reg:#04x} = {val:#05x}")
+        elif cmd == "isr":
+            interval = float(sys.argv[2]) if len(sys.argv) > 2 else 0
+            while True:
+                raw = control(fd, RT_IN, VREQ_DBG_ISR_STATS, 40)
+                n, mx, sof, xfer, setup, busy, elapsed, hz = struct.unpack("<5IQQI", raw)
+                us = lambda c: c * 1e6 / hz
+                mean = us(busy / n) if n else 0
+                load = 100 * busy / elapsed if elapsed else 0
+                print(time.strftime("%H:%M:%S"),
+                      f"isr n {n} mean {mean:.2f} us max {us(mx):.2f} us "
+                      f"(sof {us(sof):.2f} xfer {us(xfer):.2f} setup {us(setup):.2f}) "
+                      f"load {load:.2f}%", flush=True)
+                if not interval:
+                    break
+                time.sleep(interval)
         elif cmd == "clear-stats":
             control(fd, RT_OUT, VREQ_CLEAR_STATS)
             print("cleared")

@@ -6,6 +6,10 @@ description = "diyuac2 UAC2 firmware for the i.MX RT1020 (Rust port)"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+# Test only: disable the high-speed chirp so the link comes up at full speed.
+force-full-speed = []
+
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 imxrt-hal = { version = "0.6", features = ["imxrt1020"] }
