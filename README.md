@@ -6,10 +6,22 @@ MIMXRT1020-EVK. Digital core for the ac2 measurement frontend. See
 
 ## Status
 
-M1 (TinyUSB `uac2_speaker_fb`, high speed): enumerates at 480M, async with
-explicit feedback EP, 120 s `aplay` at 48 kHz without xruns. Feedback is
-FIFO-count based in the stock example (no real audio clock yet), so the
-long soak is deferred to M3 when SAI provides real timing.
+- M1 (TinyUSB `uac2_speaker_fb`): enumerates at 480M, async with explicit
+  feedback EP, 120 s `aplay` at 48 kHz without xruns.
+- M2 (`firmware/`, own descriptors, `cafe:0ac2`): UAC2 2 in / 2 out, S32_LE
+  with 24 valid bits, 48/96/192 kHz, async + explicit feedback, vendor
+  control interface ([protocol](docs/vendor-protocol.md)). No audio hardware
+  yet: playback is looped back to capture, paced by SysTick. Tested on Linux
+  only (Windows/macOS not tested, not a current target):
+  - bit-exact loopback at all rates, no xruns, no slips
+    (`tools/loopback_test.py`), except: the first 1-4 microframes of a
+    playback stream are lost at stream start (iso OUT endpoint is primed
+    only after SET_INTERFACE is processed in task context)
+  - feedback mean within +1.7 / +1.2 / +8.1 Hz of 48 / 96 / 192 kHz
+    (FIFO-count placeholder; replaced by measured SAI timing in M3)
+  - vendor control selftest passes (`tools/vendorctl.py selftest`)
+
+Long soak is deferred to M3 when SAI provides real timing.
 
 ## Toolchain
 
@@ -25,12 +37,12 @@ export PATH="$HOME/.local/opt/arm-gnu-toolchain-14.3.rel1-x86_64-arm-none-eabi/b
 
 ```sh
 git submodule update --init            # TinyUSB, pinned at 0.21.0
-cd lib/tinyusb/examples/device/uac2_speaker_fb
-make BOARD=mimxrt1020_evk get-deps     # NXP MCUX SDK, CMSIS, etc.
+cd firmware
+make BOARD=mimxrt1020_evk get-deps     # one-time: NXP MCUX SDK, CMSIS, etc.
 make BOARD=mimxrt1020_evk -j
 ```
 
-Output: `_build/mimxrt1020_evk/uac2_speaker_fb.{elf,hex,bin}`
+Output: `firmware/_build/mimxrt1020_evk/firmware.{elf,hex,bin}`
 
 ## Board setup (MIMXRT1020-EVK)
 
@@ -45,7 +57,7 @@ Output: `_build/mimxrt1020_evk/uac2_speaker_fb.{elf,hex,bin}`
 ## Flash
 
 ```sh
-pyocd load -t mimxrt1020 _build/mimxrt1020_evk/uac2_speaker_fb.hex
+pyocd load -t mimxrt1020 firmware/_build/mimxrt1020_evk/firmware.hex
 ```
 
 Alternatively copy the `.hex` to the DAPLink `RT1020-EVK` drive.

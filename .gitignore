@@ -1,2 +1,5 @@
 # Vendor datasheets/manuals (copyrighted, not redistributed)
 *.pdf
+
+# Build output
+_build/

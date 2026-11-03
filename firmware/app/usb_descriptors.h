@@ -1,0 +1,123 @@
+// diyuac2 USB descriptor layout.
+//
+// Configuration (high speed only; full-speed operation is not supported):
+//
+//   IAD (itf 0..2) UAC2 function
+//     itf 0  Audio Control
+//              Clock Source 0x04 (internal, programmable: 48/96/192 kHz)
+//              Playback: IT 0x01 (USB streaming, 2ch) -> OT 0x03 (line out)
+//              Capture:  IT 0x11 (line in, 2ch)       -> OT 0x13 (USB streaming)
+//     itf 1  Audio Streaming OUT (playback)
+//              alt 0: zero bandwidth
+//              alt 1: 2ch, 24-bit in 32-bit slots, iso OUT EP 0x01 (async)
+//                     + explicit feedback iso IN EP 0x81
+//     itf 2  Audio Streaming IN (capture)
+//              alt 0: zero bandwidth
+//              alt 1: 2ch, 24-bit in 32-bit slots, iso IN EP 0x82 (async)
+//   itf 3  Vendor control interface (class 0xFF, no endpoints).
+//          Commands are vendor control requests on EP0, see docs/vendor-protocol.md.
+//
+// No Feature Unit on purpose: this is a measurement device, host-side
+// volume/mute must not alter the signal path. Hosts fall back to software
+// volume, which measurement software bypasses by using hw: devices.
+
+#ifndef USB_DESCRIPTORS_H_
+#define USB_DESCRIPTORS_H_
+
+enum {
+  ITF_NUM_AUDIO_CONTROL = 0,
+  ITF_NUM_AUDIO_STREAMING_OUT,
+  ITF_NUM_AUDIO_STREAMING_IN,
+  ITF_NUM_VENDOR,
+  ITF_NUM_TOTAL
+};
+
+#define ITF_NUM_AUDIO_TOTAL 3 // interfaces covered by the audio IAD
+
+// UAC2 entity IDs
+#define UAC2_ENTITY_CLOCK           0x04
+#define UAC2_ENTITY_PLAY_IT         0x01
+#define UAC2_ENTITY_PLAY_OT         0x03
+#define UAC2_ENTITY_REC_IT          0x11
+#define UAC2_ENTITY_REC_OT          0x13
+
+// Endpoints
+#define EPNUM_AUDIO_OUT             0x01
+#define EPNUM_AUDIO_FB              0x81
+#define EPNUM_AUDIO_IN              0x82
+
+// External terminal type "Line connector" (USB Audio Terminal Types 1.0, 0x0603)
+#define AUDIO_TERM_TYPE_EXT_LINE    0x0603
+
+#define AUDIO_N_CHANNELS            2
+#define AUDIO_BYTES_PER_SAMPLE      4  // 32-bit slot
+#define AUDIO_RESOLUTION            24 // valid bits
+#define AUDIO_MAX_SAMPLE_RATE       192000
+#define AUDIO_CHANNEL_CFG           (AUDIO20_CHANNEL_CONFIG_FRONT_LEFT | AUDIO20_CHANNEL_CONFIG_FRONT_RIGHT)
+
+// Iso EP size: (192000/8000 + 1) * 4 * 2 = 200 bytes per microframe
+#define AUDIO_EP_SIZE               TUD_AUDIO_EP_SIZE(true, AUDIO_MAX_SAMPLE_RATE, AUDIO_BYTES_PER_SAMPLE, AUDIO_N_CHANNELS)
+
+#define DIYUAC2_AC_ENTITIES_LEN (TUD_AUDIO20_DESC_CLK_SRC_LEN \
+  + TUD_AUDIO20_DESC_INPUT_TERM_LEN + TUD_AUDIO20_DESC_OUTPUT_TERM_LEN \
+  + TUD_AUDIO20_DESC_INPUT_TERM_LEN + TUD_AUDIO20_DESC_OUTPUT_TERM_LEN)
+
+#define DIYUAC2_AUDIO_DESC_LEN (TUD_AUDIO20_DESC_IAD_LEN \
+  + TUD_AUDIO20_DESC_STD_AC_LEN + TUD_AUDIO20_DESC_CS_AC_LEN + DIYUAC2_AC_ENTITIES_LEN \
+  /* itf 1 alt 0, alt 1 */ \
+  + TUD_AUDIO20_DESC_STD_AS_LEN \
+  + TUD_AUDIO20_DESC_STD_AS_LEN + TUD_AUDIO20_DESC_CS_AS_INT_LEN + TUD_AUDIO20_DESC_TYPE_I_FORMAT_LEN \
+  + TUD_AUDIO20_DESC_STD_AS_ISO_EP_LEN + TUD_AUDIO20_DESC_CS_AS_ISO_EP_LEN + TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP_LEN \
+  /* itf 2 alt 0, alt 1 */ \
+  + TUD_AUDIO20_DESC_STD_AS_LEN \
+  + TUD_AUDIO20_DESC_STD_AS_LEN + TUD_AUDIO20_DESC_CS_AS_INT_LEN + TUD_AUDIO20_DESC_TYPE_I_FORMAT_LEN \
+  + TUD_AUDIO20_DESC_STD_AS_ISO_EP_LEN + TUD_AUDIO20_DESC_CS_AS_ISO_EP_LEN)
+
+#define DIYUAC2_AUDIO_DESCRIPTOR(_stridx_ac) \
+  TUD_AUDIO20_DESC_IAD(ITF_NUM_AUDIO_CONTROL, ITF_NUM_AUDIO_TOTAL, 0x00), \
+  TUD_AUDIO20_DESC_STD_AC(ITF_NUM_AUDIO_CONTROL, 0x00, _stridx_ac), \
+  TUD_AUDIO20_DESC_CS_AC(0x0200, AUDIO20_FUNC_IO_BOX, DIYUAC2_AC_ENTITIES_LEN, 0x00), \
+  TUD_AUDIO20_DESC_CLK_SRC(UAC2_ENTITY_CLOCK, AUDIO20_CLOCK_SOURCE_ATT_INT_PRO_CLK, \
+    (AUDIO20_CTRL_RW << AUDIO20_CLOCK_SOURCE_CTRL_CLK_FRQ_POS) | (AUDIO20_CTRL_R << AUDIO20_CLOCK_SOURCE_CTRL_CLK_VAL_POS), \
+    0x00, 0x00), \
+  /* Playback path */ \
+  TUD_AUDIO20_DESC_INPUT_TERM(UAC2_ENTITY_PLAY_IT, AUDIO_TERM_TYPE_USB_STREAMING, 0x00, UAC2_ENTITY_CLOCK, \
+    AUDIO_N_CHANNELS, AUDIO_CHANNEL_CFG, 0x00, 0x0000, 0x00), \
+  TUD_AUDIO20_DESC_OUTPUT_TERM(UAC2_ENTITY_PLAY_OT, AUDIO_TERM_TYPE_EXT_LINE, 0x00, UAC2_ENTITY_PLAY_IT, \
+    UAC2_ENTITY_CLOCK, 0x0000, 0x00), \
+  /* Capture path */ \
+  TUD_AUDIO20_DESC_INPUT_TERM(UAC2_ENTITY_REC_IT, AUDIO_TERM_TYPE_EXT_LINE, 0x00, UAC2_ENTITY_CLOCK, \
+    AUDIO_N_CHANNELS, AUDIO_CHANNEL_CFG, 0x00, 0x0000, 0x00), \
+  TUD_AUDIO20_DESC_OUTPUT_TERM(UAC2_ENTITY_REC_OT, AUDIO_TERM_TYPE_USB_STREAMING, 0x00, UAC2_ENTITY_REC_IT, \
+    UAC2_ENTITY_CLOCK, 0x0000, 0x00), \
+  /* Interface 1: playback streaming */ \
+  TUD_AUDIO20_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING_OUT, 0x00, 0x00, 0x00), \
+  TUD_AUDIO20_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING_OUT, 0x01, 0x02, 0x00), \
+  TUD_AUDIO20_DESC_CS_AS_INT(UAC2_ENTITY_PLAY_IT, AUDIO20_CTRL_NONE, AUDIO20_FORMAT_TYPE_I, \
+    AUDIO20_DATA_FORMAT_TYPE_I_PCM, AUDIO_N_CHANNELS, AUDIO_CHANNEL_CFG, 0x00), \
+  TUD_AUDIO20_DESC_TYPE_I_FORMAT(AUDIO_BYTES_PER_SAMPLE, AUDIO_RESOLUTION), \
+  TUD_AUDIO20_DESC_STD_AS_ISO_EP(EPNUM_AUDIO_OUT, \
+    (uint8_t) ((uint8_t) TUSB_XFER_ISOCHRONOUS | (uint8_t) TUSB_ISO_EP_ATT_ASYNCHRONOUS | (uint8_t) TUSB_ISO_EP_ATT_DATA), \
+    AUDIO_EP_SIZE, 0x01), \
+  TUD_AUDIO20_DESC_CS_AS_ISO_EP(AUDIO20_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, AUDIO20_CTRL_NONE, \
+    AUDIO20_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, 0x0001), \
+  /* Feedback every 2^(4-1) = 8 microframes = 1 ms */ \
+  TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP(EPNUM_AUDIO_FB, 4, 4), \
+  /* Interface 2: capture streaming */ \
+  TUD_AUDIO20_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING_IN, 0x00, 0x00, 0x00), \
+  TUD_AUDIO20_DESC_STD_AS_INT(ITF_NUM_AUDIO_STREAMING_IN, 0x01, 0x01, 0x00), \
+  TUD_AUDIO20_DESC_CS_AS_INT(UAC2_ENTITY_REC_OT, AUDIO20_CTRL_NONE, AUDIO20_FORMAT_TYPE_I, \
+    AUDIO20_DATA_FORMAT_TYPE_I_PCM, AUDIO_N_CHANNELS, AUDIO_CHANNEL_CFG, 0x00), \
+  TUD_AUDIO20_DESC_TYPE_I_FORMAT(AUDIO_BYTES_PER_SAMPLE, AUDIO_RESOLUTION), \
+  TUD_AUDIO20_DESC_STD_AS_ISO_EP(EPNUM_AUDIO_IN, \
+    (uint8_t) ((uint8_t) TUSB_XFER_ISOCHRONOUS | (uint8_t) TUSB_ISO_EP_ATT_ASYNCHRONOUS | (uint8_t) TUSB_ISO_EP_ATT_DATA), \
+    AUDIO_EP_SIZE, 0x01), \
+  TUD_AUDIO20_DESC_CS_AS_ISO_EP(AUDIO20_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, AUDIO20_CTRL_NONE, \
+    AUDIO20_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_UNDEFINED, 0x0000)
+
+// Vendor interface without endpoints: all traffic is EP0 vendor requests.
+#define DIYUAC2_VENDOR_DESC_LEN 9
+#define DIYUAC2_VENDOR_DESCRIPTOR(_itfnum, _stridx) \
+  9, TUSB_DESC_INTERFACE, _itfnum, 0x00, 0x00, TUSB_CLASS_VENDOR_SPECIFIC, 0x00, 0x00, _stridx
+
+#endif
