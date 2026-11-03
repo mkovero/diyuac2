@@ -12,7 +12,7 @@ the verified reference; this port has to reach parity with it.
 |---|---|---|
 | R1 | Boot, 500 MHz clocks, USB HS enumeration with the C descriptors, clock source and vendor requests | done |
 | R2 | Own USB stack: iso OUT/IN at high speed + feedback EP, bit-exact loopback | done |
-| R3 | SAI1 + eDMA + WM8960, measured feedback; parity with M3 | done (no long soak yet) |
+| R3 | SAI1 + eDMA + WM8960, measured feedback; parity with M3 | done |
 
 ## Build and flash
 
@@ -108,6 +108,13 @@ Results:
   rec and primed.
 - 5-minute playback and capture run: 0 underruns, 0 overruns, 0 FIFO
   errors, lead 117-119 frames, no ALSA errors.
+- 2 h soak (`/tmp/soak.sh` on the host, stats every 60 s): 0 underruns,
+  0 overruns, 0 FIFO errors in all 120 samples, lead 116-119 frames.
+  Feedback samples read 48000.977 or 48001.465 Hz, except the first, which
+  was still warming up. Capture ran the full 2 h. Playback stopped
+  cleanly after 93 minutes: the test pipes a WAV through aplay, and
+  aplay stops at the 2 GiB WAV size limit (5592 s at 384 kB/s). That is
+  a limit of the test, not the firmware.
 
 LED: blinks every 100 ms if the codec did not answer at boot.
 
