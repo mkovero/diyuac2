@@ -3,3 +3,7 @@
 
 # Build output
 _build/
+
+# Hardware photos (local reference only)
+*.jpeg
+*.jpg
