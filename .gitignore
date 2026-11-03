@@ -7,3 +7,6 @@ _build/
 # Hardware photos (local reference only)
 *.jpeg
 *.jpg
+
+# Rust build output
+rust/target/
