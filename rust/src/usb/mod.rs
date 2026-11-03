@@ -123,11 +123,13 @@ unsafe fn usb() -> &'static mut Usb {
 }
 
 /// Bring up the PHY and controller and attach. `serial` is the 32-character
-/// serial number. The USB clock gate and PLL3 must be on.
-pub fn init(serial: &str) {
+/// serial number; `audio_setup` runs on the audio function before the USB
+/// IRQ is unmasked. The USB clock gate and PLL3 must be on.
+pub fn init(serial: &str, audio_setup: impl FnOnce(&mut Audio)) {
     // SAFETY: the USB IRQ is still masked.
     let usb = unsafe { usb() };
     usb.serial.copy_from_slice(&serial.as_bytes()[..32]);
+    audio_setup(&mut usb.audio);
 
     let phy = unsafe { ral::usbphy::USBPHY::instance() };
     ral::write_reg!(ral::usbphy, phy, CTRL_SET, SFTRST: 1);
@@ -151,7 +153,13 @@ pub fn init(serial: &str) {
         ral::usb,
         regs,
         USBINTR,
-        hw::USBSTS_UI | hw::USBSTS_UEI | hw::USBSTS_PCI | hw::USBSTS_URI | hw::USBSTS_SEI | hw::USBSTS_SLI
+        hw::USBSTS_UI
+            | hw::USBSTS_UEI
+            | hw::USBSTS_PCI
+            | hw::USBSTS_URI
+            | hw::USBSTS_SEI
+            | hw::USBSTS_SLI
+            | hw::USBSTS_SRI
     );
 
     unsafe {
@@ -211,6 +219,11 @@ impl Usb {
                     (portsc & hw::PORTSC1_PSPD_MASK) >> hw::PORTSC1_PSPD_SHIFT == hw::PSPD_HIGH;
                 self.update_link();
             }
+        }
+        if status & hw::USBSTS_SRI != 0 {
+            // Every microframe at high speed: feedback measurement and
+            // playback ring housekeeping.
+            self.audio.sof(ral::read_reg!(ral::usb, regs, FRINDEX) & 0x3FFF);
         }
         if status & (hw::USBSTS_UI | hw::USBSTS_UEI) != 0 {
             let complete = ral::read_reg!(ral::usb, regs, ENDPTCOMPLETE);

@@ -12,6 +12,7 @@ imxrt-hal = { version = "0.6", features = ["imxrt1020"] }
 imxrt-ral = { version = "0.6", features = ["imxrt1021", "rt"] }
 imxrt-rt = { version = "0.1", features = ["device"] }
 panic-halt = "1"
+embedded-hal = "1"
 
 [build-dependencies]
 imxrt-rt = { version = "0.1", features = ["device"] }

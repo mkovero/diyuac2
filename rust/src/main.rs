@@ -1,18 +1,20 @@
 //! diyuac2 firmware, Rust port.
 //!
-//! R2: own ChipIdea device stack (src/usb), UAC2 + vendor interface,
-//! isochronous playback/capture/feedback with playback looped back into
-//! capture. No audio hardware yet.
+//! R3: own ChipIdea device stack (src/usb), UAC2 + vendor interface,
+//! SAI1 + eDMA + WM8960 audio path, feedback measured from the SAI clock.
 //!
 //! LED (GPIO_AD_B0_05, active low): 250 ms blink until configured, 1 s once
 //! configured, 50 ms if the link came up at full speed (a bug: this device
-//! is high speed only).
+//! is high speed only), 100 ms if the codec did not answer.
 
 #![no_std]
 #![no_main]
 
 mod audio;
+mod audio_hw;
 mod clock;
+mod codec;
+mod feedback;
 mod fcb;
 mod serial;
 mod usb;
@@ -38,13 +40,32 @@ fn main() -> ! {
         panic!()
     };
 
-    usb::init(serial::get());
+    // Audio interface first: the SAI must be clocking (MCLK) before the
+    // codec is configured, and before the USB stack measures feedback.
+    let i2c = audio_hw::init(audio_hw::Pins {
+        mclk: pads.gpio_ad_b1.p00,
+        tx_bclk: pads.gpio_ad_b1.p01,
+        tx_sync: pads.gpio_ad_b1.p02,
+        tx_data: pads.gpio_ad_b1.p03,
+        rx_data: pads.gpio_ad_b1.p05,
+        scl: pads.gpio_ad_b1.p14,
+        sda: pads.gpio_ad_b1.p15,
+    });
+    let rate = codec::RATES[0];
+    if !audio_hw::start(rate) {
+        panic!();
+    }
+    let mut codec = codec::Codec::new(i2c);
+    let codec_ok = codec.init() && codec.set_rate(rate);
+
+    usb::init(serial::get(), |audio| audio.attach(codec, codec_ok, rate));
 
     let mut last_toggle = cortex_m::peripheral::DWT::cycle_count();
     loop {
         let period_ms = match usb::LINK.load(Ordering::Relaxed) {
-            usb::LINK_CONFIGURED => 1000,
             usb::LINK_FULL_SPEED => 50,
+            _ if !codec_ok => 100,
+            usb::LINK_CONFIGURED => 1000,
             _ => 250,
         };
         let now = cortex_m::peripheral::DWT::cycle_count();

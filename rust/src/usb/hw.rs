@@ -305,6 +305,9 @@ pub fn ep0_stall() {
 
 /// Ring of `N` dTDs with one buffer each, for an isochronous endpoint. Each
 /// dTD carries one microframe's packet.
+///
+/// The dTDs and buffers are inline and the controller holds their
+/// addresses: a started ring must never be moved (no `mem::replace`/swap).
 pub struct IsoRing<const N: usize, const SIZE: usize> {
     tds: [Td; N],
     bufs: [Buf<SIZE>; N],

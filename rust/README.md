@@ -12,7 +12,7 @@ the verified reference; this port has to reach parity with it.
 |---|---|---|
 | R1 | Boot, 500 MHz clocks, USB HS enumeration with the C descriptors, clock source and vendor requests | done |
 | R2 | Own USB stack: iso OUT/IN at high speed + feedback EP, bit-exact loopback | done |
-| R3 | SAI1 + eDMA + WM8960, measured feedback, soak; parity with M3 | |
+| R3 | SAI1 + eDMA + WM8960, measured feedback; parity with M3 | done (no long soak yet) |
 
 ## Build and flash
 
@@ -77,3 +77,42 @@ Not handled or not tested yet:
 
 LED: blinks every 250 ms until the host configures the device, then every
 1 s; every 50 ms if the link is full speed.
+
+## R3 results (2026-11-03, Linux host)
+
+R3 is a port of the C M3 audio path. SAI1 is the I2S master, clocked from the
+audio PLL (PLL4 at 786.432 MHz, then ÷4, ÷16 → MCLK 12.288 MHz). eDMA
+channels 0 (TX) and 1 (RX) loop over 2048-frame rings. The WM8960 is set up
+over LPI2C1 with the same register sequence as the C firmware. SAI, CCM and
+DMA register values match a dump from the running C firmware.
+
+Everything runs in the USB ISR, with no task loop:
+- each playback packet is written straight into the TX ring, about 2 ms
+  ahead of the DMA. Frames the DMA has fetched are zeroed every microframe,
+  so a starved ring plays silence;
+- capture packets are filled straight from the RX ring;
+- feedback is measured at SOF from the words the SAI has shifted out (DMA
+  position minus FIFO fill). It is a port of `feedback.c`.
+
+Results:
+- Playback and capture together, 30 s: 0 underruns, 0 capture overruns,
+  0 SAI FIFO errors. The playback lead stays at 117-119 frames. The
+  capture has noise from the onboard mic on the right channel only
+  (-67 dB RMS, against -88 dB on the left), the same as the C firmware.
+- Feedback from usbmon over 20 s (20,000 packets): mean 48001.286 Hz,
+  standard deviation 0.235 Hz, range 48000.977-48001.465. The C firmware
+  measured 48001.3 Hz with a standard deviation of 0.27.
+- 10 start/stop cycles of 1 s each: 0 underruns.
+- DBG_CODEC_WRITE works. Registers above 0x37 stall.
+- GET_INFO reports firmware 0.3.2. The stats flags show codec_ok, play,
+  rec and primed.
+- 5-minute playback and capture run: 0 underruns, 0 overruns, 0 FIFO
+  errors, lead 117-119 frames, no ALSA errors.
+
+LED: blinks every 100 ms if the codec did not answer at boot.
+
+A bug found along the way: `IsoRing` holds its dTDs inline. Moving a
+started ring (`mem::replace` around the service call) handed the
+controller stack addresses. Capture then sent only zero-length packets.
+The data path state now lives in its own struct, so the service closures
+borrow disjoint fields instead.
