@@ -200,3 +200,49 @@ still plays silence (see `ZERO_LAG` in `src/audio.rs`).
 - Capture packet sizes at 192 kHz vary between 22 and 25 frames per
   microframe (nominal 24). The average follows the SAI clock, with no
   overruns.
+
+### 2 h soak at 192 kHz (2026-11-03)
+
+`tools/lbsoak.py 3 7200 192000` with the loopback on, playback and
+capture running together, and stats polled every minute:
+
+- PASS: 1,382,400,000 frames (7200.0 s) bit-exact, 0 mismatches.
+- 0 underruns, 0 capture overruns or drops, 0 SAI FIFO errors. The
+  playback lead stayed at 422..426 frames for the whole run.
+- Feedback 192004.883 Hz (0x00180028).
+- USB ISR over 180 million entries: mean 2.15 us, max 8.89 us, load
+  5.37 %. The max came from a setup packet (8.20 us, the stats
+  polling); SOF max was 2.28 us and transfer max 4.20 us.
+
+### usbfs host abuse tests at 192 kHz (2026-11-03)
+
+`tools/usbhost.py` detaches snd-usb-audio and runs its own iso host:
+playback paced by the device feedback, a counter pattern through the
+debug loopback, and capture checked frame by frame. All tests pass at
+192 kHz on ketunkolo (`sudo RATE=192000 python3 tools/usbhost.py`):
+
+- stream: 10 s, 1.92 M frames, 0 discontinuities, 0 counters.
+- ratechange: SET_CUR 192→48, 48→192 and 192→96 kHz mid-stream. GET_CUR
+  follows, the rings restart (2–3 discontinuities at the switch), and a
+  clean stream follows.
+- halt: SET_FEATURE and CLEAR_FEATURE(ENDPOINT_HALT) on 0x01, 0x81 and
+  0x82 mid-stream. 0 discontinuities.
+- oddsize: OUT packets with 3 or 7 junk bytes (not a whole frame), and a
+  zero-length packet every 101st. 0 corrupt frames; the zero-length
+  packets count as underruns (26), as they should.
+- altstorm: 1000 SET_INTERFACE in 0.87 s plus 50 short streams, then a
+  clean stream.
+- control: 21 malformed requests (wLength short and long, SET_CUR with
+  bad lengths or rates, unknown entities, selectors, descriptors and
+  vendor requests, wrong interface). All give the expected length or
+  stall, and a clean stream follows.
+
+The same tests through QEMU usb-host passthrough to a VM fail. The iso
+IN data arrives with missing frames, stale frames from earlier
+transfers and zero-filled gaps, while the firmware is clean on bare
+metal. Raising QEMU's usb-host iso buffering from the default
+isobufs=4, isobsize=32 to 32/64 (added from the monitor with a passed
+fd) removed the stale frames and cut the discontinuities from 437 to 50
+in 10 s. The rest is one zeroed frame about every 0.2 s, which matches
+the rate of 25-frame (200-byte, max size) capture packets (not verified
+per packet). Don't use VM passthrough for iso data checks.

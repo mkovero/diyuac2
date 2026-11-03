@@ -4,9 +4,10 @@
 # back at high speed and that a clean 5 s playback + capture still runs
 # with zero error counters.
 #
-# Not covered: SET_CUR rate changes and CLEAR_FEATURE(ENDPOINT_HALT) while
-# streaming. usbfs refuses class and endpoint requests to interfaces that
-# snd-usb-audio holds (only vendor requests pass).
+# Not covered here: SET_CUR rate changes and CLEAR_FEATURE(ENDPOINT_HALT)
+# while streaming. usbfs refuses class and endpoint requests to interfaces
+# that snd-usb-audio holds (only vendor requests pass); tools/usbhost.py
+# detaches the driver and covers them.
 #
 #   [RATE=192000] faults.sh [case...]    cases: reset port suspend openclose order all
 set -u
