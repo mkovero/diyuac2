@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""diyuac2 vendor control interface client (draft protocol v0.1).
+"""diyuac2 vendor control interface client (draft protocol v0.2).
 
 Dependency-free: talks to the device through Linux usbfs ioctls.
 Needs write access to the device node (root, or a udev rule, see docs/vendor-protocol.md).
@@ -8,6 +8,9 @@ Needs write access to the device node (root, or a udev rule, see docs/vendor-pro
   vendorctl.py scratch-write <hex bytes>
   vendorctl.py scratch-read
   vendorctl.py selftest
+  vendorctl.py stats [interval_s]     # once, or repeatedly
+  vendorctl.py clear-stats
+  vendorctl.py codec-write <reg> <val>  # debug, WM8960: 7-bit reg, 9-bit value (hex ok)
 """
 
 import ctypes
@@ -15,6 +18,7 @@ import fcntl
 import os
 import struct
 import sys
+import time
 
 VID, PID = 0xCAFE, 0x0AC2
 ITF_VENDOR = 3
@@ -22,7 +26,16 @@ ITF_VENDOR = 3
 VREQ_GET_INFO = 0x00
 VREQ_GET_SCRATCH = 0x01
 VREQ_SET_SCRATCH = 0x02
+VREQ_GET_STATS = 0x03
+VREQ_CLEAR_STATS = 0x04
+VREQ_DBG_CODEC_WRITE = 0x10
 SCRATCH_SIZE = 32
+
+STATS_FMT = "<9I2H"  # vendor_stats_t, 40 bytes
+STATS_FIELDS = ("rate", "feedback", "play_underruns", "rec_overruns", "rec_drops",
+                "tx_fifo_errors", "rx_fifo_errors", "play_lead_min", "play_lead_max",
+                "flags", "reserved")
+FLAG_NAMES = ("codec_ok", "play", "rec", "primed")
 
 # bmRequestType: vendor, recipient interface
 RT_IN = 0x80 | 0x40 | 0x01
@@ -81,6 +94,25 @@ def get_info(fd):
     return {"protocol": f"{pmaj}.{pmin}", "firmware": f"{fmaj}.{fmin}.{fpat}", "flags": flags}
 
 
+def get_stats(fd):
+    raw = control(fd, RT_IN, VREQ_GET_STATS, struct.calcsize(STATS_FMT))
+    st = dict(zip(STATS_FIELDS, struct.unpack(STATS_FMT, raw)))
+    for k in ("play_lead_min", "play_lead_max"):
+        if st[k] >= 1 << 31:
+            st[k] -= 1 << 32
+    return st
+
+
+def format_stats(st):
+    fb = st["feedback"]
+    hz = fb * 8000 / 65536
+    flags = ",".join(n for i, n in enumerate(FLAG_NAMES) if st["flags"] & (1 << i)) or "-"
+    return (f"rate {st['rate']} fb 0x{fb:08x} = {hz:.3f} Hz ({hz - st['rate']:+.3f}) "
+            f"underruns {st['play_underruns']} rec_overruns {st['rec_overruns']} "
+            f"rec_drops {st['rec_drops']} sai_fifo_err tx {st['tx_fifo_errors']} rx {st['rx_fifo_errors']} "
+            f"lead {st['play_lead_min']}..{st['play_lead_max']} [{flags}]")
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -107,6 +139,22 @@ def main():
                 print("unknown request: NOT stalled (bad)")
             except OSError as e:
                 print(f"unknown request: stalled as expected ({e.strerror})")
+        elif cmd == "stats":
+            interval = float(sys.argv[2]) if len(sys.argv) > 2 else 0
+            while True:
+                print(time.strftime("%H:%M:%S"), format_stats(get_stats(fd)), flush=True)
+                if not interval:
+                    break
+                time.sleep(interval)
+        elif cmd == "codec-write":
+            reg, val = int(sys.argv[2], 0), int(sys.argv[3], 0)
+            if reg > 0x7F or val > 0x1FF:
+                sys.exit("reg <= 0x7f, val <= 0x1ff")
+            control(fd, RT_OUT, VREQ_DBG_CODEC_WRITE, value=(reg << 9) | val)
+            print(f"R{reg:#04x} = {val:#05x}")
+        elif cmd == "clear-stats":
+            control(fd, RT_OUT, VREQ_CLEAR_STATS)
+            print("cleared")
         else:
             sys.exit(__doc__)
     finally:

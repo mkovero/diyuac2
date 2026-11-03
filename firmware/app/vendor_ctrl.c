@@ -5,6 +5,7 @@
 #include "tusb.h"
 #include "usb_descriptors.h"
 #include "vendor_ctrl.h"
+#include "codec.h"
 
 static uint8_t scratch[VENDOR_SCRATCH_SIZE];
 static uint8_t scratch_rx[VENDOR_SCRATCH_SIZE];
@@ -52,6 +53,31 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       if (stage == CONTROL_STAGE_DATA) {
         memset(scratch, 0, sizeof(scratch));
         memcpy(scratch, scratch_rx, req->wLength);
+      }
+      return true;
+
+    case VREQ_GET_STATS:
+      if (!dir_in) return false;
+      if (stage == CONTROL_STAGE_SETUP) {
+        static vendor_stats_t st;
+        audio_get_stats(&st);
+        return tud_control_xfer(rhport, req, &st, sizeof(st));
+      }
+      return true;
+
+    case VREQ_CLEAR_STATS:
+      if (dir_in || req->wLength != 0) return false;
+      if (stage == CONTROL_STAGE_SETUP) {
+        audio_clear_stats();
+        return tud_control_status(rhport, req);
+      }
+      return true;
+
+    case VREQ_DBG_CODEC_WRITE:
+      if (dir_in || req->wLength != 0) return false;
+      if (stage == CONTROL_STAGE_SETUP) {
+        if (!codec_write_reg(req->wValue >> 9, req->wValue & 0x1FF)) return false;
+        return tud_control_status(rhport, req);
       }
       return true;
 

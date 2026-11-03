@@ -21,7 +21,26 @@ MIMXRT1020-EVK. Digital core for the ac2 measurement frontend. See
     (FIFO-count placeholder; replaced by measured SAI timing in M3)
   - vendor control selftest passes (`tools/vendorctl.py selftest`)
 
-Long soak is deferred to M3 when SAI provides real timing.
+- M3 (SAI1 + eDMA + WM8960, MCU is I2S master, MCLK 12.288 MHz from the
+  audio PLL): playback to the J11 headphone output and capture from the
+  codec inputs, measured feedback ([docs/feedback.md](docs/feedback.md)).
+  - **48 kHz only**: the WM8960 is specified up to 48 kHz. The device takes
+    its rate list from the codec driver, so 96 and 192 kHz return with the
+    CS4270 (M5).
+  - 60 s of playback and capture: 0 underruns, overruns or SAI FIFO errors.
+    Feedback mean 48001.30 Hz, stdev 0.27 Hz. Playback lead stable at
+    103..113 frames.
+  - Capture: onboard mic P1 found on the **right** channel (RINPUT1/2
+    differential) by a routing scan with music vs quiet (+29 dB boost:
+    >300 Hz level -68 -> -57 dBFS). Left inputs showed no signal (probably
+    the J11 headset mic). Default mic boost is 0 dB, so P1 is quiet. A real
+    analog loopback through J11 is still untested.
+  - Do not connect J12/J13 (class-D BTL speaker outputs) to an audio
+    interface input; use J11 for loopback.
+  - Multi-hour soak: in progress.
+  - Debug: `tools/vendorctl.py codec-write <reg> <val>` writes WM8960
+    registers live (vendor request 0x10, not part of the stable protocol).
+  - The headphone path is at 0 dB (DAC and HP amp). Test signals are loud.
 
 ## Toolchain
 
@@ -79,6 +98,13 @@ cat /proc/asound/cardN/stream0             # formats, ASYNC, sync EP 0x81
 aplay -D hw:N,0 -f S16_LE -c 2 -r 48000 -d 120 /dev/zero   # watch for "underrun"
 sudo modprobe usbmon
 sudo cat /sys/kernel/debug/usb/usbmon/<bus>u | grep ' C Zi:<bus>:<dev>:1 '
+```
+
+Audio path diagnostics (see [vendor protocol](docs/vendor-protocol.md)):
+
+```sh
+sudo tools/vendorctl.py clear-stats
+sudo tools/vendorctl.py stats 60     # underruns, FIFO errors, feedback, playback lead
 ```
 
 Feedback at high speed is 16.16 samples per microframe, little-endian:

@@ -15,4 +15,15 @@ INC += app
 
 SRC_C += $(wildcard app/*.c)
 
+# NXP SDK drivers used by the audio hardware layer (paths relative to TinyUSB).
+SRC_C += \
+	$(MCUX_CORE)/drivers/sai/fsl_sai.c \
+	$(MCUX_CORE)/drivers/lpi2c/fsl_lpi2c.c
+INC += \
+	$(TOP)/$(MCUX_CORE)/drivers/sai \
+	$(TOP)/$(MCUX_CORE)/drivers/lpi2c
+
+# Bounded waits in the LPI2C driver instead of hanging on a stuck bus.
+CFLAGS += -DI2C_RETRY_TIMES=100000U
+
 include ../lib/tinyusb/hw/bsp/family_rules.mk
