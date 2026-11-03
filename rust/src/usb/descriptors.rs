@@ -14,6 +14,10 @@
 //!        docs/vendor-protocol.md
 //! ```
 //!
+//! The device is high speed only. On a full-speed link the configuration
+//! has the vendor interface alone ([`FS_CONFIG`]), so no audio card appears
+//! and host tools can still read GET_INFO, which flags the link.
+//!
 //! No Feature Unit on purpose: host-side volume/mute must not alter the
 //! signal path of a measurement device.
 
@@ -62,16 +66,17 @@ pub const DEVICE: [u8; 18] = [
     1,                      // bNumConfigurations
 ];
 
-/// High speed only: the other-speed configuration is empty (no interfaces),
-/// telling hosts there is no full-speed function.
 #[rustfmt::skip]
 pub const DEVICE_QUALIFIER: [u8; 10] = [
     10, 0x06, 0x00, 0x02, 0xEF, 0x02, 0x01, EP0_SIZE as u8, 1, 0,
 ];
 
+/// Full-speed configuration: the vendor interface only. Its interface
+/// number stays 3, so host tools address it the same way at either speed.
 #[rustfmt::skip]
-pub const OTHER_SPEED_CONFIG: [u8; 9] = [
-    9, 0x07, 9, 0, 0, 1, 0, 0xC0, 0,
+pub const FS_CONFIG: [u8; 18] = [
+    9, 0x02, 18, 0, 1, CONFIG_VALUE, 0, 0xC0, 0,
+    9, 0x04, ITF_VENDOR, 0, 0, 0xFF, 0x00, 0x00, 5,
 ];
 
 pub const CONFIG_VALUE: u8 = 1;

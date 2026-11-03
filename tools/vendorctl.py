@@ -11,6 +11,7 @@ Needs write access to the device node (root, or a udev rule, see docs/vendor-pro
   vendorctl.py stats [interval_s]     # once, or repeatedly
   vendorctl.py clear-stats
   vendorctl.py codec-write <reg> <val>  # debug, WM8960: 7-bit reg, 9-bit value (hex ok)
+  vendorctl.py loopback on|off      # debug: capture returns the played data (TX ring)
   vendorctl.py isr [interval_s]       # debug: USB ISR cycle profile (clear-stats resets it)
 """
 
@@ -31,13 +32,14 @@ VREQ_GET_STATS = 0x03
 VREQ_CLEAR_STATS = 0x04
 VREQ_DBG_CODEC_WRITE = 0x10
 VREQ_DBG_ISR_STATS = 0x11
+VREQ_DBG_LOOPBACK = 0x12
 SCRATCH_SIZE = 32
 
 STATS_FMT = "<9I2H"  # vendor_stats_t, 40 bytes
 STATS_FIELDS = ("rate", "feedback", "play_underruns", "rec_overruns", "rec_drops",
                 "tx_fifo_errors", "rx_fifo_errors", "play_lead_min", "play_lead_max",
                 "flags", "reserved")
-FLAG_NAMES = ("codec_ok", "play", "rec", "primed")
+FLAG_NAMES = ("codec_ok", "play", "rec", "primed", "codec_out_of_spec", "loopback")
 
 # bmRequestType: vendor, recipient interface
 RT_IN = 0x80 | 0x40 | 0x01
@@ -123,8 +125,9 @@ def main():
     try:
         if cmd == "info":
             info = get_info(fd)
-            stub = " (stub)" if info["flags"] & 1 else ""
-            print(f"protocol {info['protocol']}, firmware {info['firmware']}, flags 0x{info['flags']:04x}{stub}")
+            names = [n for bit, n in ((1, "stub"), (2, "FULL SPEED: no audio")) if info["flags"] & bit]
+            tag = f" ({', '.join(names)})" if names else ""
+            print(f"protocol {info['protocol']}, firmware {info['firmware']}, flags 0x{info['flags']:04x}{tag}")
         elif cmd == "scratch-write":
             data = bytes.fromhex("".join(sys.argv[2:]))
             print(f"wrote {control(fd, RT_OUT, VREQ_SET_SCRATCH, data=data)} bytes")
@@ -169,6 +172,10 @@ def main():
                 if not interval:
                     break
                 time.sleep(interval)
+        elif cmd == "loopback":
+            on = sys.argv[2] == "on"
+            control(fd, RT_OUT, VREQ_DBG_LOOPBACK, value=int(on))
+            print("loopback", "on" if on else "off")
         elif cmd == "clear-stats":
             control(fd, RT_OUT, VREQ_CLEAR_STATS)
             print("cleared")

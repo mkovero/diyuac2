@@ -8,9 +8,10 @@
 # streaming. usbfs refuses class and endpoint requests to interfaces that
 # snd-usb-audio holds (only vendor requests pass).
 #
-#   faults.sh [case...]    cases: reset port suspend openclose order all
+#   [RATE=192000] faults.sh [case...]    cases: reset port suspend openclose order all
 set -u
 CARD=${CARD:-3}
+RATE=${RATE:-48000}
 VC="sudo -n python3 $(dirname "$0")/vendorctl.py"
 FAIL=0
 
@@ -33,12 +34,12 @@ wait_dev() {    # wait until enumerated and the ALSA card is back
 }
 
 play() {    # play [secs]: 1 kHz sine, raw (no WAV size limit)
-	sox -n -r 48000 -c 2 -b 32 -e signed -t raw - synth "$1" sine 1000 vol 0.1 2>/dev/null |
-		aplay -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r 48000 2>>/tmp/faults_alsa.err
+	sox -n -r $RATE -c 2 -b 32 -e signed -t raw - synth "$1" sine 1000 vol 0.1 2>/dev/null |
+		aplay -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r $RATE 2>>/tmp/faults_alsa.err
 }
 
 rec() {
-	arecord -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r 48000 -d "$1" /dev/null 2>>/tmp/faults_alsa.err
+	arecord -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r $RATE -d "$1" /dev/null 2>>/tmp/faults_alsa.err
 }
 
 check() {    # check <case>: speed, clean stream, zero counters
@@ -101,7 +102,7 @@ case_openclose() {    # 100 short open/close cycles, mixed directions
 		case $((i % 3)) in
 		0) play 0.05 ;;
 		1) rec 1 & play 0.05; wait ;;
-		2) timeout 0.3 arecord -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r 48000 /dev/null 2>/dev/null ;;
+		2) timeout 0.3 arecord -q -D hw:$CARD,0 -t raw -f S32_LE -c 2 -r $RATE /dev/null 2>/dev/null ;;
 		esac
 		i=$((i + 1))
 	done

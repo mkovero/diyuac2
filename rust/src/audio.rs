@@ -31,6 +31,8 @@ const VENDOR_PROTO_VERSION: (u8, u8) = (0, 2);
 const FW_VERSION: (u8, u8, u8) = (0, 3, 2);
 /// Same as the C firmware: commands beyond the transport test are drafts.
 const INFO_FLAG_STUB: u16 = 0x0001;
+/// The link is full speed: the audio function is not offered.
+const INFO_FLAG_FULL_SPEED: u16 = 0x0002;
 
 const VREQ_GET_INFO: u8 = 0x00;
 const VREQ_GET_SCRATCH: u8 = 0x01;
@@ -39,6 +41,11 @@ const VREQ_GET_STATS: u8 = 0x03;
 const VREQ_CLEAR_STATS: u8 = 0x04;
 const VREQ_DBG_CODEC_WRITE: u8 = 0x10;
 const VREQ_DBG_ISR_STATS: u8 = 0x11;
+const VREQ_DBG_LOOPBACK: u8 = 0x12;
+
+/// Sample rates offered (clock source RANGE). The SAI/USB path runs all of
+/// them; the WM8960 is only specified up to 48 kHz ([`codec::RATES`]).
+pub const RATES: &[u32] = &[48_000, 96_000, 192_000];
 
 const SCRATCH_SIZE: usize = 32;
 
@@ -46,6 +53,10 @@ const STATS_FLAG_CODEC_OK: u16 = 1 << 0;
 const STATS_FLAG_PLAY_ACTIVE: u16 = 1 << 1;
 const STATS_FLAG_REC_ACTIVE: u16 = 1 << 2;
 const STATS_FLAG_PLAY_PRIMED: u16 = 1 << 3;
+/// The rate is outside the codec's specification: analog I/O is not valid.
+const STATS_FLAG_CODEC_OUT_OF_SPEC: u16 = 1 << 4;
+/// Debug loopback: capture carries the playback data back (DBG_LOOPBACK).
+const STATS_FLAG_LOOPBACK: u16 = 1 << 5;
 
 /// dTDs per data endpoint ring.
 const RING_TDS: usize = 8;
@@ -60,6 +71,12 @@ const PLAY_GUARD: u32 = 16;
 const PLAY_MAX_LEAD: u32 = RING_FRAMES as u32 / 2;
 /// Playback starts this far ahead of the DMA: 2 ms at the stream rate.
 const PLAY_PRIME_MS: u32 = 2;
+/// Played frames are zeroed this far behind the DMA, so the debug loopback
+/// can still read them. Silence on starvation still holds: the frames the
+/// DMA reaches after the writer are a ring lap old, and with
+/// lead <= PLAY_MAX_LEAD they are more than ZERO_LAG behind.
+const ZERO_LAG: u32 = 512;
+const _: () = assert!(PLAY_MAX_LEAD + ZERO_LAG <= RING_FRAMES as u32);
 
 struct Stats {
     play_underruns: u32,
@@ -107,6 +124,8 @@ struct Path {
     /// Next frame position to read from the RX ring.
     rec_rd: u32,
     rec_restart: bool,
+    /// Debug: capture reads the TX ring (what the SAI sent) instead of RX.
+    loopback: bool,
     stats: Stats,
 }
 
@@ -136,15 +155,19 @@ impl Path {
 
     /// Clear what the TX DMA has fetched since the last call.
     fn zero_played(&mut self, rd: u32) {
+        let end = rd.wrapping_sub(ZERO_LAG);
+        if (end.wrapping_sub(self.play.zeroed) as i32) <= 0 {
+            return;
+        }
         let ring = audio_hw::tx_ring();
-        let mut pos = rd.wrapping_sub(rd.wrapping_sub(self.play.zeroed).min(RING_FRAMES as u32));
-        while pos != rd {
+        let mut pos = end.wrapping_sub(end.wrapping_sub(self.play.zeroed).min(RING_FRAMES as u32));
+        while pos != end {
             let i = (pos & RING_MASK) as usize;
-            let chunk = (rd.wrapping_sub(pos) as usize).min(RING_FRAMES - i);
+            let chunk = (end.wrapping_sub(pos) as usize).min(RING_FRAMES - i);
             ring[i * CHANNELS..(i + chunk) * CHANNELS].fill(0);
             pos = pos.wrapping_add(chunk as u32);
         }
-        self.play.zeroed = rd;
+        self.play.zeroed = end;
     }
 
     /// One playback packet into the TX ring.
@@ -191,7 +214,9 @@ impl Path {
 
     /// Fill one capture packet from the RX ring; returns its length.
     fn rec_packet(&mut self, buf: &mut [u8]) -> usize {
-        let wr = audio_hw::rx_frames_written();
+        // Loopback: TX frames the DMA has fetched (they are zeroed only
+        // ZERO_LAG later), paced by the same SAI frame clock as RX.
+        let wr = if self.loopback { audio_hw::tx_frames_fetched() } else { audio_hw::rx_frames_written() };
         let nominal = self.frames_per_uframe();
         if self.rec_restart {
             self.rec_restart = false;
@@ -205,7 +230,7 @@ impl Path {
         }
         // Normally `nominal` or one more; never more than fits a packet.
         let take = n.min(nominal + 1).min((EP_SIZE / FRAME_BYTES) as u32);
-        let ring = audio_hw::rx_ring();
+        let ring: &[u32] = if self.loopback { audio_hw::tx_ring() } else { audio_hw::rx_ring() };
         for f in 0..take as usize {
             let i = (self.rec_rd & RING_MASK) as usize * CHANNELS;
             for c in 0..CHANNELS {
@@ -230,6 +255,7 @@ pub struct Audio {
     feedback: Feedback,
     codec: Option<Codec>,
     codec_ok: bool,
+    full_speed: bool,
     scratch: [u8; SCRATCH_SIZE],
 }
 
@@ -242,15 +268,17 @@ impl Audio {
             fb_ring: IsoRing::new(EP_AUDIO, true),
             in_ring: IsoRing::new(EP_CAPTURE, true),
             path: Path {
-                rate: codec::RATES[0],
+                rate: RATES[0],
                 play: Play { wr: 0, zeroed: 0, primed: false, starved: false },
                 rec_rd: 0,
                 rec_restart: true,
+                loopback: false,
                 stats: Stats::new(),
             },
-            feedback: Feedback::new(codec::RATES[0]),
+            feedback: Feedback::new(RATES[0]),
             codec: None,
             codec_ok: false,
+            full_speed: false,
             scratch: [0; SCRATCH_SIZE],
         }
     }
@@ -261,6 +289,11 @@ impl Audio {
         self.codec_ok = codec_ok;
         self.path.rate = rate;
         self.path.restart();
+    }
+
+    /// Link speed changed. At full speed only the vendor interface exists.
+    pub fn set_full_speed(&mut self, full_speed: bool) {
+        self.full_speed = full_speed;
     }
 
     fn set_rate(&mut self, rate: u32) -> bool {
@@ -382,7 +415,7 @@ impl Audio {
         let itf = req.index as u8;
         let entity = (req.index >> 8) as u8;
         match req.kind() {
-            KIND_CLASS if itf == ITF_AC && entity == desc::ENTITY_CLOCK => {
+            KIND_CLASS if itf == ITF_AC && entity == desc::ENTITY_CLOCK && !self.full_speed => {
                 if req.dir_in() {
                     self.clock_get(req, buf)
                 } else {
@@ -402,7 +435,7 @@ impl Audio {
                 let selector = (req.value >> 8) as u8;
                 if req.request == REQ_CUR && selector == CS_SAM_FREQ_CONTROL && data.len() == 4 {
                     let rate = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    if codec::RATES.contains(&rate) && self.set_rate(rate) {
+                    if RATES.contains(&rate) && self.set_rate(rate) {
                         return Reply::Ack;
                     }
                 }
@@ -427,9 +460,9 @@ impl Audio {
             }
             (CS_SAM_FREQ_CONTROL, REQ_RANGE) => {
                 // Layout 3 parameter block: wNumSubRanges, then {min, max, res}.
-                let n = codec::RATES.len().min(8);
+                let n = RATES.len().min(8);
                 buf[0..2].copy_from_slice(&(n as u16).to_le_bytes());
-                for (i, &r) in codec::RATES.iter().take(n).enumerate() {
+                for (i, &r) in RATES.iter().take(n).enumerate() {
                     let o = 2 + 12 * i;
                     buf[o..o + 4].copy_from_slice(&r.to_le_bytes());
                     buf[o + 4..o + 8].copy_from_slice(&r.to_le_bytes());
@@ -448,7 +481,9 @@ impl Audio {
     fn vendor(&mut self, req: &Request, buf: &mut [u8]) -> Reply {
         match (req.request, req.dir_in()) {
             (VREQ_GET_INFO, true) => {
-                let flags = INFO_FLAG_STUB.to_le_bytes();
+                let flags = (INFO_FLAG_STUB
+                    | if self.full_speed { INFO_FLAG_FULL_SPEED } else { 0 })
+                .to_le_bytes();
                 buf[..8].copy_from_slice(&[
                     VENDOR_PROTO_VERSION.0,
                     VENDOR_PROTO_VERSION.1,
@@ -490,6 +525,11 @@ impl Audio {
                     .is_some_and(|c| c.write_reg(req.value >> 9, req.value & 0x1FF));
                 if ok { Reply::Ack } else { Reply::Stall }
             }
+            (VREQ_DBG_LOOPBACK, false) if req.length == 0 && req.value <= 1 => {
+                self.path.loopback = req.value == 1;
+                self.path.rec_restart = true;
+                Reply::Ack
+            }
             (VREQ_DBG_ISR_STATS, true) => {
                 crate::profile::bytes(&mut buf[..crate::profile::BYTES]);
                 Reply::In(crate::profile::BYTES)
@@ -520,7 +560,9 @@ impl Audio {
         let flags = (if self.codec_ok { STATS_FLAG_CODEC_OK } else { 0 })
             | (if self.alt_out != 0 { STATS_FLAG_PLAY_ACTIVE } else { 0 })
             | (if self.alt_in != 0 { STATS_FLAG_REC_ACTIVE } else { 0 })
-            | (if self.path.play.primed { STATS_FLAG_PLAY_PRIMED } else { 0 });
+            | (if self.path.play.primed { STATS_FLAG_PLAY_PRIMED } else { 0 })
+            | (if codec::RATES.contains(&self.path.rate) { 0 } else { STATS_FLAG_CODEC_OUT_OF_SPEC })
+            | (if self.path.loopback { STATS_FLAG_LOOPBACK } else { 0 });
         st[36..38].copy_from_slice(&flags.to_le_bytes());
         st[38..40].fill(0);
     }

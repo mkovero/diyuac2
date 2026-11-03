@@ -155,8 +155,48 @@ Not covered: SET_CUR rate changes and endpoint halt while streaming.
 usbfs refuses class and endpoint requests to interfaces that snd-usb-audio
 holds. snd-usb-audio does not send halt requests to iso endpoints.
 
-Full speed, forced with the `force-full-speed` feature (PFSC). The LED
-blinks fast, and the kernel logs "not running at top speed". The device
-still returns the high-speed configuration, so snd-usb-audio creates the
-card. Playback "works" with 999 underruns in 3 s. Capture fails with EIO.
-The host gets no clear error: this is open.
+Full speed, forced with the `force-full-speed` feature (PFSC). The device
+is high speed only. At full speed the configuration holds the vendor
+interface alone (still interface 3), so no audio card appears. GET_INFO
+sets flag bit 1, which `vendorctl.py info` prints as "FULL SPEED: no
+audio". The LED blinks every 50 ms. Linux logs "not running at top speed"
+and "config 1 has no interface number 0". At high speed, the other-speed
+descriptor returns this vendor-only configuration.
+
+Before this change, the high-speed configuration was also sent at full
+speed. snd-usb-audio created the card, playback ran with 999 underruns in
+3 s, and capture failed with EIO. The C firmware sends one configuration
+at both speeds, so it probably behaves the same way. Not checked.
+
+The fault suite passes again on the high-speed build after this change.
+
+## 48/96/192 kHz and the SAI loopback (2026-11-03)
+
+The clock source offers 48, 96 and 192 kHz. The SAI root clock is
+256 fs (49.152 MHz at 192 kHz, from PLL4 / 4 / (768000 / rate)), with
+BCLK = 64 fs. The WM8960 is specified only up to 48 kHz. At 96 and
+192 kHz it runs out of spec, and the analog I/O is not valid. The stats
+flag `codec_out_of_spec` (bit 4) marks this.
+
+Debug request 0x12 (`vendorctl.py loopback on`) makes capture return the
+playback data as the SAI sent it. Capture reads the TX ring behind the
+DMA, paced by the same SAI frame clock as the RX path. This tests USB in
+both directions, the SAI timing and the feedback, bit-exact, without
+depending on the codec. Played frames are zeroed 512 frames behind the
+DMA, not at once, so the loopback can still read them. A starved ring
+still plays silence (see `ZERO_LAG` in `src/audio.rs`).
+
+- `tools/loopback.py 3 10 <rate>`: 10 s bit-exact at 48, 96 and 192 kHz.
+  0 counters. The playback lead is 117/219/424 frames, about 2.2 ms.
+- 192 kHz, playback and capture: ISR mean 2.15 us, max 3.75 us, load
+  4.4 %.
+- Feedback at 192 kHz (usbmon, 20,000 packets): mean 192005.06 Hz,
+  standard deviation 0.236 Hz. That is +26 ppm, the same offset as at
+  48 kHz (48001.3).
+- The fault suite passes at 192 kHz (`RATE=192000 tools/faults.sh`).
+- `tools/lbsoak.py`: a streaming bit-exact checker for long runs. It
+  repeats a 1 s random block and checks every frame. It caught a glitch
+  injected by switching the loopback off for a moment.
+- Capture packet sizes at 192 kHz vary between 22 and 25 frames per
+  microframe (nominal 24). The average follows the SAI clock, with no
+  overruns.

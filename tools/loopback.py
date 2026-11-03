@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Bit-exact loopback test for diyuac2 R2 firmware (playback looped into capture).
+"""Bit-exact loopback test for diyuac2 (playback looped into capture: R2
+firmware, or the Rust firmware with `vendorctl.py loopback on`).
+
+  loopback.py [card] [secs] [rate]
 
 Plays N seconds of random 32-bit stereo frames on hw:CARD and records at the
 same time, then searches the recording for the played block and compares it
@@ -9,7 +12,8 @@ import os, random, subprocess, sys, time
 
 card = sys.argv[1] if len(sys.argv) > 1 else "3"
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
-rate, ch, bps = 48000, 2, 4
+rate = int(sys.argv[3]) if len(sys.argv) > 3 else 48000
+ch, bps = 2, 4
 frame = ch * bps
 n = int(secs * rate)
 rnd = random.Random(1234)

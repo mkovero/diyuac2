@@ -254,7 +254,8 @@ impl Usb {
         profile::exit(entry);
     }
 
-    fn update_link(&self) {
+    fn update_link(&mut self) {
+        self.audio.set_full_speed(!self.high_speed);
         let link = if !self.high_speed {
             LINK_FULL_SPEED
         } else if self.configured {
@@ -442,6 +443,12 @@ impl Usb {
                 }
                 _ => Reply::Stall,
             },
+            // Full speed: only the vendor interface exists.
+            (RCPT_INTERFACE, STANDARD_GET_INTERFACE | STANDARD_SET_INTERFACE)
+                if !self.high_speed && req.index as u8 != desc::ITF_VENDOR =>
+            {
+                Reply::Stall
+            }
             (RCPT_INTERFACE, STANDARD_GET_INTERFACE) if self.configured => {
                 match self.audio.get_interface(req.index as u8) {
                     Some(alt) => {
@@ -465,11 +472,19 @@ impl Usb {
     fn descriptor(&mut self, req: &Request) -> Reply {
         let index = req.value as u8;
         let buf = &mut self.ep0_buf.0;
+        // Configuration for this speed (0x02) or the other one (0x07).
+        let (hs_config, fs_config): (&[u8], &[u8]) = (&desc::CONFIG, &desc::FS_CONFIG);
         let src: &[u8] = match (req.value >> 8) as u8 {
             0x01 => &desc::DEVICE,
-            0x02 => &desc::CONFIG,
+            0x02 if self.high_speed => hs_config,
+            0x02 => fs_config,
             0x06 => &desc::DEVICE_QUALIFIER,
-            0x07 => &desc::OTHER_SPEED_CONFIG,
+            0x07 => {
+                let other = if self.high_speed { fs_config } else { hs_config };
+                buf[..other.len()].copy_from_slice(other);
+                buf[1] = 0x07;
+                return Reply::In(other.len());
+            }
             0x03 => {
                 let n = match index {
                     0 => {

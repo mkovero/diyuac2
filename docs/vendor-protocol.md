@@ -45,7 +45,7 @@ Only the transport and a version query exist now.
 | 3 | 1 | firmware minor |
 | 4 | 1 | firmware patch |
 | 5 | 1 | reserved (0) |
-| 6 | 2 | flags; bit 0 = stub firmware |
+| 6 | 2 | flags; bit 0 = stub firmware, bit 1 = full-speed link (the device is high speed only; at full speed it offers only the vendor interface, no audio) |
 
 SCRATCH is a transport test (round trip of an OUT and IN data stage), not
 part of the final protocol.
@@ -56,6 +56,7 @@ Debug requests (0x10 and up) are not part of the protocol and may change:
 |---|---|---|---|---|
 | 0x10 | DBG_CODEC_WRITE | OUT | 0 | `wValue = reg << 9 \| value` (WM8960: 7-bit register, 9-bit value) |
 | 0x11 | DBG_ISR_STATS | IN | 40 | USB ISR cycle profile, Rust firmware only (below); CLEAR_STATS resets it |
+| 0x12 | DBG_LOOPBACK | OUT | 0 | Rust firmware only: `wValue` 1 = capture returns the playback data as the SAI sent it (TX ring, SAI-clocked), 0 = capture from the codec |
 
 DBG_ISR_STATS data (little endian, cycles of the core clock):
 
@@ -83,7 +84,7 @@ DBG_ISR_STATS data (little endian, cycles of the core clock):
 | 24 | 4 | SAI RX FIFO errors |
 | 28 | 4 | playback lead minimum, frames (int32) |
 | 32 | 4 | playback lead maximum, frames (int32) |
-| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed |
+| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed, 4 rate outside the codec's specification (Rust firmware: 96/192 kHz on the WM8960), 5 debug loopback on |
 | 38 | 2 | reserved (0) |
 
 Playback lead is how far the firmware has written into the TX ring ahead of
