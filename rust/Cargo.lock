@@ -86,11 +86,33 @@ name = "diyuac2"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "diyuac2-common",
  "embedded-hal 1.0.0",
  "imxrt-hal",
  "imxrt-ral",
  "imxrt-rt",
  "panic-halt",
+]
+
+[[package]]
+name = "diyuac2-boot"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "diyuac2-common",
+ "imxrt-hal",
+ "imxrt-ral",
+ "imxrt-rt",
+ "panic-halt",
+]
+
+[[package]]
+name = "diyuac2-common"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "imxrt-hal",
+ "imxrt-ral",
 ]
 
 [[package]]

@@ -11,7 +11,7 @@ On top of the stream it does what snd-usb-audio never does: SET_CUR rate
 changes while streaming, endpoint halt requests, odd OUT packet sizes,
 alt-setting storms, malformed control requests.
 
-  usbhost.py [test...]     tests: stream ratechange halt oddsize altstorm control all
+  usbhost.py [test...]     tests: stream ratechange halt oddsize altstorm gain control all
   RATE=192000 SECS=10      stream rate and length of the plain stream test
 
 Needs root. The kernel driver is re-attached at exit. DEBUG=1 prints the
@@ -109,12 +109,20 @@ class Dev:
             ioctl(self.fd, CLAIMINTERFACE, ctypes.byref(ctypes.c_uint(itf)))
 
     def close(self):
-        for itf in (ITF_AC, ITF_OUT, ITF_IN, ITF_VENDOR):
+        # Release everything first: snd-usb-audio probes on interface 0 and
+        # claims the streaming interfaces itself; if they are still held,
+        # the card comes back without PCM streams.
+        itfs = (ITF_AC, ITF_OUT, ITF_IN, ITF_VENDOR)
+        for itf in itfs:
             try:
                 ioctl(self.fd, RELEASEINTERFACE, ctypes.byref(ctypes.c_uint(itf)))
-                ioctl(self.fd, IOCTL, ctypes.byref(IoctlReq(itf, CONNECT, None)))
             except OSError:
                 pass
+        for itf in itfs:
+            try:
+                ioctl(self.fd, IOCTL, ctypes.byref(IoctlReq(itf, CONNECT, None)))
+            except OSError:
+                pass                                  # already bound (claimed by the driver)
         os.close(self.fd)
 
     def control(self, rtype, req, value, index, data=b"", length=None):
@@ -140,6 +148,16 @@ class Dev:
 
     def get_rate(self):
         return struct.unpack("<I", self.control(0xA1, 0x01, 0x0100, 0x0400, length=4))[0]
+
+    # Feature Units: 0x02 playback, 0x12 capture; master channel only.
+    def set_volume(self, fu, centi_db256):
+        return self.control(0x21, 0x01, 0x0200, fu << 8, struct.pack("<h", centi_db256))
+
+    def get_volume(self, fu):
+        return struct.unpack("<h", self.control(0xA1, 0x01, 0x0200, fu << 8, length=2))[0]
+
+    def set_mute(self, fu, on):
+        return self.control(0x21, 0x01, 0x0100, fu << 8, bytes([int(on)]))
 
     def vendor_in(self, req, length):
         return self.control(0xC1, req, 0, ITF_VENDOR, length=length)
@@ -353,7 +371,9 @@ def t_stream(dev):
 
 def t_ratechange(dev):
     ok = True
-    for a, b in ((192000, 48000), (48000, 192000), (192000, 96000)):
+    # 44.1 kHz family changes reprogram the audio PLL.
+    for a, b in ((192000, 48000), (48000, 192000), (192000, 96000), (192000, 176400), (176400, 44100),
+                 (44100, 192000)):
         def change(s, b=b):
             dev.set_rate(b)
             s.rate_changed = dev.get_rate()
@@ -444,16 +464,24 @@ def t_control(dev):
     expect("GET_CUR freq, wLength 2", lambda: dev.control(0xA1, 1, 0x0100, 0x0400, length=2), 2)
     expect("GET_CUR freq, wLength 64", lambda: dev.control(0xA1, 1, 0x0100, 0x0400, length=64), 4)
     expect("GET_RANGE freq, wLength 2", lambda: dev.control(0xA1, 2, 0x0100, 0x0400, length=2), 2)
-    expect("GET_RANGE freq, full", lambda: dev.control(0xA1, 2, 0x0100, 0x0400, length=255), 38)
+    expect("GET_RANGE freq, full", lambda: dev.control(0xA1, 2, 0x0100, 0x0400, length=255), 74)
     expect("SET_CUR freq, 3 bytes", lambda: dev.control(0x21, 1, 0x0100, 0x0400, b"\x00\xee\x02"), "stall")
     expect("SET_CUR freq, 8 bytes", lambda: dev.control(0x21, 1, 0x0100, 0x0400, bytes(8)), "stall")
-    expect("SET_CUR freq 44100", lambda: dev.set_rate(44100), "stall")
+    expect("SET_CUR freq 32000", lambda: dev.set_rate(32000), "stall")
     expect("SET_CUR freq 0", lambda: dev.set_rate(0), "stall")
     expect("GET_CUR unknown selector 0x05", lambda: dev.control(0xA1, 1, 0x0500, 0x0400, length=4), "stall")
     expect("GET_CUR unknown entity 0x09", lambda: dev.control(0xA1, 1, 0x0100, 0x0900, length=4), "stall")
+    expect("FU GET_RANGE volume", lambda: dev.control(0xA1, 2, 0x0200, 0x0200, length=64), 8)
+    expect("FU GET_CUR mute", lambda: dev.control(0xA1, 1, 0x0100, 0x1200, length=1), 1)
+    expect("FU GET_RANGE mute", lambda: dev.control(0xA1, 2, 0x0100, 0x0200, length=64), "stall")
+    expect("FU GET_CUR volume channel 1", lambda: dev.control(0xA1, 1, 0x0201, 0x0200, length=2), "stall")
+    expect("FU SET_CUR volume, 3 bytes", lambda: dev.control(0x21, 1, 0x0200, 0x0200, bytes(3)), "stall")
+    expect("FU SET_CUR mute, 4 bytes", lambda: dev.control(0x21, 1, 0x0100, 0x1200, bytes(4)), "stall")
+    expect("FU unknown selector 0x03 (bass)", lambda: dev.control(0xA1, 1, 0x0300, 0x0200, length=1), "stall")
+    expect("SET_CUR to clock with FU mute size", lambda: dev.control(0x21, 1, 0x0100, 0x0400, b"\x01"), "stall")
     expect("class request to itf 1", lambda: dev.control(0xA1, 1, 0x0100, 0x0001, length=4), "stall")
     # usbfs refuses wLength > PAGE_SIZE (EINVAL), so 4096 is the largest testable.
-    expect("GET_DESCRIPTOR config, wLength 4096", lambda: dev.control(0x80, 6, 0x0200, 0, length=4096), 227)
+    expect("GET_DESCRIPTOR config, wLength 4096", lambda: dev.control(0x80, 6, 0x0200, 0, length=4096), 281)
     expect("GET_DESCRIPTOR config, wLength 9", lambda: dev.control(0x80, 6, 0x0200, 0, length=9), 9)
     expect("GET_DESCRIPTOR string 200", lambda: dev.control(0x80, 6, 0x03C8, 0x0409, length=255), "stall")
     expect("GET_DESCRIPTOR type 0x0F (BOS)", lambda: dev.control(0x80, 6, 0x0F00, 0, length=255), "stall")
@@ -468,8 +496,113 @@ def t_control(dev):
     return report("control", ok and len(s.disc) == 0 and clean(st), summary(s, st))
 
 
+FU_PLAY, FU_REC = 0x02, 0x12
+FLAG_GAIN = 1 << 6
+
+
+def gain_q30(db256):
+    """The firmware's Q2.30 factor for a volume in 1/256 dB (gain.rs)."""
+    g = 1.0
+    for _ in range(-db256 // 128):
+        g *= 0.9440608762859234
+    return int(g * (1 << 30) + 0.5)
+
+
+def scale(x, q):
+    x = x - (1 << 32) if x >= 1 << 31 else x
+    return ((x * q) >> 30) & 0xFFFFFFFF
+
+
+class RawStream(Stream):
+    """Keeps the captured bytes instead of checking the counter (parsed after
+    the stream: parsing here would slow the pump and starve playback)."""
+    def _check_in(self, data):
+        self.frames_in += len(data) // FRAME
+        if not hasattr(self, "raw"):
+            self.raw = bytearray()
+        self.raw += data[:len(data) - len(data) % FRAME]
+
+
+def gain_stream(dev, secs=2):
+    dev.set_rate(RATE)
+    dev.vendor_out(0x04)
+    dev.set_interface(ITF_OUT, 1)
+    dev.set_interface(ITF_IN, 1)
+    s = RawStream(dev, RATE)
+    s.start()
+    s.pump(time.monotonic() + secs)
+    st = dev.stats()
+    s.stop()
+    dev.set_interface(ITF_OUT, 0)
+    dev.set_interface(ITF_IN, 0)
+    return [f for f in struct.iter_unpack("<II", bytes(getattr(s, "raw", b""))) if f != (0, 0)], st
+
+
+def check_scaled(frames, q):
+    """Every captured frame must be counter frame n scaled by q, n consecutive.
+    At low gains several n scale alike, so the start is the candidate that
+    also matches the next 2048 frames; then each frame must match the next n."""
+    match = lambda n, a, b: scale(n, q) == a and scale(~n & 0xFFFFFFFF, q) == b
+    # Counter values that scale to a left sample of 0 are ambiguous (the
+    # start of the stream at low gain): skip them.
+    frames = [f for f in frames if f[0] != 0]
+    bad, prev, i = 0, None, 0
+    while i < len(frames):
+        a, b = frames[i]
+        if prev is not None:
+            if match(prev + 1, a, b):
+                prev += 1
+                i += 1
+                continue
+            bad += 1
+        a_s = a - (1 << 32) if a >= 1 << 31 else a
+        n0, w = (a_s << 30) // q, (1 << 30) // q + 2
+        ahead = frames[i:i + 2048]
+        prev = next((n for n in range(max(n0 - w, 0), n0 + w + 1)
+                     if all(match(n + k, x, y) for k, (x, y) in enumerate(ahead))), None)
+        if prev is None:
+            bad += 1
+        i += 1
+    return bad
+
+
+def t_gain(dev):
+    ok = True
+    for fu, name in ((FU_PLAY, "playback"), (FU_REC, "capture")):
+        for db256 in (-6 * 256, -60 * 256):
+            dev.set_volume(fu, db256)
+            q = gain_q30(db256)
+            frames, st = gain_stream(dev)
+            bad = check_scaled(frames, q)
+            good = (dev.get_volume(fu) == db256 and len(frames) > RATE and bad == 0 and st["flags"] & FLAG_GAIN
+                    and clean(st))
+            ok &= report(f"gain {name} {db256 / 256:+.1f} dB", good,
+                         f"{len(frames)} frames, {bad} not exactly scaled (q {q:#x}), flags {st['flags']:#x}, "
+                         f"underruns {st['underruns']} overruns {st['rec_overruns']}")
+        dev.set_volume(fu, 0)
+        dev.set_mute(fu, True)
+        frames, st = gain_stream(dev)
+        ok &= report(f"gain {name} mute", not frames and bool(st["flags"] & FLAG_GAIN) and clean(st),
+                     f"{len(frames)} non-zero frames, flags {st['flags']:#x}, "
+                     f"underruns {st['underruns']} overruns {st['rec_overruns']}")
+        dev.set_mute(fu, False)
+    # Out of range clamps, odd values round to 0.5 dB.
+    dev.set_volume(FU_PLAY, 10 * 256)
+    v1 = dev.get_volume(FU_PLAY)
+    dev.set_volume(FU_PLAY, -32768)
+    v2 = dev.get_volume(FU_PLAY)
+    dev.set_volume(FU_PLAY, -300)
+    v3 = dev.get_volume(FU_PLAY)
+    dev.set_volume(FU_PLAY, 0)
+    ok &= report("gain clamp/round", (v1, v2, v3) == (0, -100 * 256, -256),
+                 f"+10 dB -> {v1}, -128 dB -> {v2}, -300/256 dB -> {v3} (1/256 dB)")
+    s, st = run_stream(dev, RATE, 3)
+    return report("gain: back at 0 dB", ok and len(s.disc) == 0 and clean(st) and not st["flags"] & FLAG_GAIN,
+                  summary(s, st)) and ok
+
+
 TESTS = dict(stream=t_stream, ratechange=t_ratechange, halt=t_halt, oddsize=t_oddsize,
-             altstorm=t_altstorm, control=t_control)
+             altstorm=t_altstorm, gain=t_gain, control=t_control)
 
 
 def main():
@@ -480,6 +613,11 @@ def main():
     fails = 0
     try:
         dev.vendor_out(0x12, 1)                   # debug loopback on
+        # Unity gain: the host mixer (WirePlumber) sets its own volume at
+        # every enumeration, which would scale the counter frames.
+        for fu in (FU_PLAY, FU_REC):
+            dev.set_volume(fu, 0)
+            dev.set_mute(fu, False)
         for n in names:
             fails += not TESTS[n](dev)
     finally:

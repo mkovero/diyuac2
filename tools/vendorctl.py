@@ -39,7 +39,7 @@ STATS_FMT = "<9I2H"  # vendor_stats_t, 40 bytes
 STATS_FIELDS = ("rate", "feedback", "play_underruns", "rec_overruns", "rec_drops",
                 "tx_fifo_errors", "rx_fifo_errors", "play_lead_min", "play_lead_max",
                 "flags", "reserved")
-FLAG_NAMES = ("codec_ok", "play", "rec", "primed", "codec_out_of_spec", "loopback")
+FLAG_NAMES = ("codec_ok", "play", "rec", "primed", "codec_out_of_spec", "loopback", "gain")
 
 # bmRequestType: vendor, recipient interface
 RT_IN = 0x80 | 0x40 | 0x01

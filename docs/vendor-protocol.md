@@ -84,7 +84,7 @@ DBG_ISR_STATS data (little endian, cycles of the core clock):
 | 24 | 4 | SAI RX FIFO errors |
 | 28 | 4 | playback lead minimum, frames (int32) |
 | 32 | 4 | playback lead maximum, frames (int32) |
-| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed, 4 rate outside the codec's specification (Rust firmware: 96/192 kHz on the WM8960), 5 debug loopback on |
+| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed, 4 rate outside the codec's specification (Rust firmware: 88.2 to 192 kHz on the WM8960), 5 debug loopback on, 6 a Feature Unit is muted or not at 0 dB (the path is not bit-exact; Rust firmware 0.3.3+) |
 | 38 | 2 | reserved (0) |
 
 Playback lead is how far the firmware has written into the TX ring ahead of

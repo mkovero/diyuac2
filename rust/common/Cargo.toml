@@ -1,0 +1,12 @@
+[package]
+name = "diyuac2-common"
+version = "0.1.0"
+edition = "2024"
+description = "Code shared by the diyuac2 app and bootloader: USB device core, clocks, flash, layout"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+cortex-m = "0.7"
+imxrt-hal = { version = "0.6", features = ["imxrt1020"] }
+imxrt-ral = { version = "0.6", features = ["imxrt1021"] }

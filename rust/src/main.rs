@@ -1,7 +1,11 @@
 //! diyuac2 firmware, Rust port.
 //!
-//! R3: own ChipIdea device stack (src/usb), UAC2 + vendor interface,
-//! SAI1 + eDMA + WM8960 audio path, feedback measured from the SAI clock.
+//! R3: own ChipIdea device stack (common/src/usb), UAC2 + vendor + DFU
+//! runtime interfaces, SAI1 + eDMA + WM8960 audio path, feedback measured
+//! from the SAI clock.
+//!
+//! The image runs at flash offset 0x40000, started by the DFU bootloader
+//! (`boot/`), which the boot ROM starts from the flash beginning.
 //!
 //! LED (GPIO_AD_B0_05, active low): 250 ms blink until configured, 1 s once
 //! configured, 50 ms if the link came up at full speed (a bug: this device
@@ -12,16 +16,14 @@
 
 mod audio;
 mod audio_hw;
-mod clock;
 mod codec;
 mod feedback;
-mod fcb;
-mod profile;
-mod serial;
+mod gain;
 mod usb;
 
 use core::sync::atomic::Ordering;
 
+use diyuac2_common::{clock, serial};
 use imxrt_hal as hal;
 use imxrt_ral as ral;
 use panic_halt as _;
@@ -52,7 +54,7 @@ fn main() -> ! {
         scl: pads.gpio_ad_b1.p14,
         sda: pads.gpio_ad_b1.p15,
     });
-    let rate = codec::RATES[0];
+    let rate = audio::DEFAULT_RATE;
     if !audio_hw::start(rate) {
         panic!();
     }
@@ -63,6 +65,9 @@ fn main() -> ! {
 
     let mut last_toggle = cortex_m::peripheral::DWT::cycle_count();
     loop {
+        if audio::DETACH_REQUESTED.load(Ordering::Acquire) {
+            usb::restart_into_bootloader();
+        }
         let period_ms = match usb::LINK.load(Ordering::Relaxed) {
             usb::LINK_FULL_SPEED => 50,
             _ if !codec_ok => 100,

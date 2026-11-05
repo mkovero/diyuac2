@@ -12,23 +12,41 @@
 use crate::audio_hw::{self, CHANNELS, RING_FRAMES};
 use crate::codec::{self, Codec};
 use crate::feedback::Feedback;
+use crate::gain::{self, Gain};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::usb::descriptors::{
     self as desc, EP_AUDIO, EP_CAPTURE, EP_SIZE, FB_SIZE, FRAME_BYTES, ITF_AC, ITF_AS_IN, ITF_AS_OUT,
-    ITF_VENDOR,
+    ITF_DFU, ITF_VENDOR,
 };
 use crate::usb::hw::{IsoRing, QhList};
-use crate::usb::{KIND_CLASS, KIND_VENDOR, RCPT_INTERFACE, Reply, Request};
+use crate::usb::{Function, KIND_CLASS, KIND_VENDOR, RCPT_INTERFACE, Reply, Request};
+use diyuac2_common::profile;
+
+// DFU 1.1 class requests (runtime interface)
+const DFU_DETACH: u8 = 0x00;
+const DFU_GETSTATUS: u8 = 0x03;
+const DFU_GETSTATE: u8 = 0x05;
+const DFU_STATE_APP_IDLE: u8 = 0;
+
+/// Set when the host sent DFU_DETACH and its status stage finished; the
+/// main loop then restarts into the bootloader.
+pub static DETACH_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 // UAC2 requests and clock source control selectors
 const REQ_CUR: u8 = 0x01;
 const REQ_RANGE: u8 = 0x02;
 const CS_SAM_FREQ_CONTROL: u8 = 0x01;
 const CS_CLOCK_VALID_CONTROL: u8 = 0x02;
+// Feature unit control selectors
+const FU_MUTE_CONTROL: u8 = 0x01;
+const FU_VOLUME_CONTROL: u8 = 0x02;
 
 // Vendor protocol (docs/vendor-protocol.md)
 const VENDOR_PROTO_VERSION: (u8, u8) = (0, 2);
 /// 0.3.x = Rust port. 0.3.2: R3 (SAI + WM8960, measured feedback).
-const FW_VERSION: (u8, u8, u8) = (0, 3, 2);
+/// 0.3.3: 44.1 kHz family, Feature Units (digital volume/mute).
+const FW_VERSION: (u8, u8, u8) = (0, 4, 0);
 /// Same as the C firmware: commands beyond the transport test are drafts.
 const INFO_FLAG_STUB: u16 = 0x0001;
 /// The link is full speed: the audio function is not offered.
@@ -45,7 +63,9 @@ const VREQ_DBG_LOOPBACK: u8 = 0x12;
 
 /// Sample rates offered (clock source RANGE). The SAI/USB path runs all of
 /// them; the WM8960 is only specified up to 48 kHz ([`codec::RATES`]).
-pub const RATES: &[u32] = &[48_000, 96_000, 192_000];
+pub const RATES: &[u32] = &[44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+/// Rate after power-up.
+pub const DEFAULT_RATE: u32 = 48_000;
 
 const SCRATCH_SIZE: usize = 32;
 
@@ -55,6 +75,8 @@ const STATS_FLAG_REC_ACTIVE: u16 = 1 << 2;
 const STATS_FLAG_PLAY_PRIMED: u16 = 1 << 3;
 /// The rate is outside the codec's specification: analog I/O is not valid.
 const STATS_FLAG_CODEC_OUT_OF_SPEC: u16 = 1 << 4;
+/// A Feature Unit is muted or not at 0 dB: the path is not bit-exact.
+const STATS_FLAG_GAIN: u16 = 1 << 6;
 /// Debug loopback: capture carries the playback data back (DBG_LOOPBACK).
 const STATS_FLAG_LOOPBACK: u16 = 1 << 5;
 
@@ -126,6 +148,9 @@ struct Path {
     rec_restart: bool,
     /// Debug: capture reads the TX ring (what the SAI sent) instead of RX.
     loopback: bool,
+    /// Feature Units 0x02 (playback) and 0x12 (capture).
+    play_gain: Gain,
+    rec_gain: Gain,
     stats: Stats,
 }
 
@@ -138,6 +163,12 @@ impl Path {
     /// Frames per microframe at the current rate, rounded down.
     fn frames_per_uframe(&self) -> u32 {
         self.rate / 8000
+    }
+
+    /// Most frames in one capture packet: the nominal count rounded up
+    /// (44.1 kHz alternates 5 and 6), plus one to catch up.
+    fn max_frames_per_uframe(&self) -> u32 {
+        self.rate.div_ceil(8000) + 1
     }
 
     /// SOF: keep the played part of the TX ring silent, starvation check,
@@ -199,10 +230,12 @@ impl Path {
 
         let ring = audio_hw::tx_ring();
         let mut src = data.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        let unity = self.play_gain.unity();
         for _ in 0..frames {
             let i = (self.play.wr & RING_MASK) as usize * CHANNELS;
             for c in 0..CHANNELS {
-                ring[i + c] = src.next().unwrap_or(0);
+                let s = src.next().unwrap_or(0);
+                ring[i + c] = if unity { s } else { self.play_gain.apply(s) };
             }
             self.play.wr = self.play.wr.wrapping_add(1);
         }
@@ -229,13 +262,16 @@ impl Path {
             n = nominal;
         }
         // Normally `nominal` or one more; never more than fits a packet.
-        let take = n.min(nominal + 1).min((EP_SIZE / FRAME_BYTES) as u32);
+        let take = n.min(self.max_frames_per_uframe()).min((EP_SIZE / FRAME_BYTES) as u32);
         let ring: &[u32] = if self.loopback { audio_hw::tx_ring() } else { audio_hw::rx_ring() };
+        let unity = self.rec_gain.unity();
         for f in 0..take as usize {
             let i = (self.rec_rd & RING_MASK) as usize * CHANNELS;
             for c in 0..CHANNELS {
                 let o = (f * CHANNELS + c) * 4;
-                buf[o..o + 4].copy_from_slice(&ring[i + c].to_le_bytes());
+                let s = ring[i + c];
+                let s = if unity { s } else { self.rec_gain.apply(s) };
+                buf[o..o + 4].copy_from_slice(&s.to_le_bytes());
             }
             self.rec_rd = self.rec_rd.wrapping_add(1);
         }
@@ -268,14 +304,16 @@ impl Audio {
             fb_ring: IsoRing::new(EP_AUDIO, true),
             in_ring: IsoRing::new(EP_CAPTURE, true),
             path: Path {
-                rate: RATES[0],
+                rate: DEFAULT_RATE,
                 play: Play { wr: 0, zeroed: 0, primed: false, starved: false },
                 rec_rd: 0,
                 rec_restart: true,
                 loopback: false,
+                play_gain: Gain::new(),
+                rec_gain: Gain::new(),
                 stats: Stats::new(),
             },
-            feedback: Feedback::new(RATES[0]),
+            feedback: Feedback::new(DEFAULT_RATE),
             codec: None,
             codec_ok: false,
             full_speed: false,
@@ -291,10 +329,6 @@ impl Audio {
         self.path.restart();
     }
 
-    /// Link speed changed. At full speed only the vendor interface exists.
-    pub fn set_full_speed(&mut self, full_speed: bool) {
-        self.full_speed = full_speed;
-    }
 
     fn set_rate(&mut self, rate: u32) -> bool {
         if rate == self.path.rate {
@@ -315,7 +349,7 @@ impl Audio {
     }
 
     /// Bus reset or configuration change: all streams off.
-    pub fn reset(&mut self) {
+    fn streams_off(&mut self) {
         if self.alt_out != 0 {
             self.out_ring.stop();
             self.fb_ring.stop();
@@ -329,18 +363,18 @@ impl Audio {
         self.path.play.starved = false;
     }
 
-    pub fn get_interface(&self, itf: u8) -> Option<u8> {
+    fn alt(&self, itf: u8) -> Option<u8> {
         match itf {
-            ITF_AC | ITF_VENDOR => Some(0),
+            ITF_AC | ITF_VENDOR | ITF_DFU => Some(0),
             ITF_AS_OUT => Some(self.alt_out),
             ITF_AS_IN => Some(self.alt_in),
             _ => None,
         }
     }
 
-    pub fn set_interface(&mut self, itf: u8, alt: u8, qhs: &mut QhList) -> bool {
+    fn set_alt(&mut self, itf: u8, alt: u8, qhs: &mut QhList) -> bool {
         match (itf, alt) {
-            (ITF_AC | ITF_VENDOR, 0) => true,
+            (ITF_AC | ITF_VENDOR | ITF_DFU, 0) => true,
             (ITF_AS_OUT, 0) => {
                 if self.alt_out != 0 {
                     self.out_ring.stop();
@@ -359,7 +393,7 @@ impl Audio {
                 self.feedback.reset(self.path.rate);
                 self.out_ring.start_out(qhs);
                 self.fb_ring.start_in(qhs, FB_SIZE as u16);
-                self.service(qhs);
+                self.pump(qhs);
                 true
             }
             (ITF_AS_IN, 0) => {
@@ -373,7 +407,7 @@ impl Audio {
                 self.alt_in = 1;
                 self.path.rec_restart = true;
                 self.in_ring.start_in(qhs, EP_SIZE as u16);
-                self.service(qhs);
+                self.pump(qhs);
                 true
             }
             _ => false,
@@ -382,7 +416,7 @@ impl Audio {
 
     /// SOF (every microframe): feedback measurement, keep the played part
     /// of the TX ring silent, starvation check, SAI error flags.
-    pub fn sof(&mut self, frindex: u32) {
+    fn on_sof(&mut self, frindex: u32) {
         self.path.sof();
         if self.alt_out != 0 {
             self.feedback.sof(frindex, audio_hw::tx_words_played);
@@ -390,7 +424,7 @@ impl Audio {
     }
 
     /// Endpoint completions (USB ISR).
-    pub fn service(&mut self, qhs: &mut QhList) {
+    fn pump(&mut self, qhs: &mut QhList) {
         let path = &mut self.path;
         if self.alt_out != 0 {
             self.out_ring.service_out(qhs, |data| path.play_packet(data));
@@ -408,7 +442,7 @@ impl Audio {
     // --- control requests ------------------------------------------------
 
     /// Class and vendor SETUP. IN data goes to `buf`.
-    pub fn control(&mut self, req: &Request, buf: &mut [u8], _qhs: &mut QhList) -> Reply {
+    fn setup(&mut self, req: &Request, buf: &mut [u8]) -> Reply {
         if req.recipient() != RCPT_INTERFACE {
             return Reply::Stall;
         }
@@ -422,15 +456,25 @@ impl Audio {
                     Reply::Out
                 }
             }
+            KIND_CLASS if itf == ITF_AC && !self.full_speed && self.fu(entity).is_some() => {
+                if req.dir_in() {
+                    self.fu_get(entity, req, buf)
+                } else {
+                    Reply::Out
+                }
+            }
             KIND_VENDOR if itf == ITF_VENDOR => self.vendor(req, buf),
+            KIND_CLASS if itf == ITF_DFU => dfu_runtime(req, buf),
             _ => Reply::Stall,
         }
     }
 
     /// OUT data stage finished.
-    pub fn control_out(&mut self, req: &Request, data: &[u8]) -> Reply {
+    fn setup_out(&mut self, req: &Request, data: &[u8]) -> Reply {
         let itf = req.index as u8;
+        let entity = (req.index >> 8) as u8;
         match req.kind() {
+            KIND_CLASS if itf == ITF_AC && entity != desc::ENTITY_CLOCK => self.fu_set(entity, req, data),
             KIND_CLASS if itf == ITF_AC => {
                 let selector = (req.value >> 8) as u8;
                 if req.request == REQ_CUR && selector == CS_SAM_FREQ_CONTROL && data.len() == 4 {
@@ -449,6 +493,63 @@ impl Audio {
             }
             _ => Reply::Stall,
         }
+    }
+
+    fn fu(&self, entity: u8) -> Option<&Gain> {
+        match entity {
+            desc::ENTITY_FU_PLAY => Some(&self.path.play_gain),
+            desc::ENTITY_FU_REC => Some(&self.path.rec_gain),
+            _ => None,
+        }
+    }
+
+    /// Feature Unit GET. Master channel (CN 0) only.
+    fn fu_get(&self, entity: u8, req: &Request, buf: &mut [u8]) -> Reply {
+        let (selector, channel) = ((req.value >> 8) as u8, req.value as u8);
+        let Some(g) = self.fu(entity) else {
+            return Reply::Stall;
+        };
+        if channel != 0 {
+            return Reply::Stall;
+        }
+        match (selector, req.request) {
+            (FU_MUTE_CONTROL, REQ_CUR) => {
+                buf[0] = g.mute() as u8;
+                Reply::In(1)
+            }
+            (FU_VOLUME_CONTROL, REQ_CUR) => {
+                buf[..2].copy_from_slice(&g.volume().to_le_bytes());
+                Reply::In(2)
+            }
+            (FU_VOLUME_CONTROL, REQ_RANGE) => {
+                // One subrange {min, max, res}, 1/256 dB.
+                buf[0..2].copy_from_slice(&1u16.to_le_bytes());
+                buf[2..4].copy_from_slice(&gain::VOL_MIN.to_le_bytes());
+                buf[4..6].copy_from_slice(&gain::VOL_MAX.to_le_bytes());
+                buf[6..8].copy_from_slice(&gain::VOL_RES.to_le_bytes());
+                Reply::In(8)
+            }
+            _ => Reply::Stall,
+        }
+    }
+
+    /// Feature Unit SET_CUR (data stage done).
+    fn fu_set(&mut self, entity: u8, req: &Request, data: &[u8]) -> Reply {
+        let (selector, channel) = ((req.value >> 8) as u8, req.value as u8);
+        let g = match entity {
+            desc::ENTITY_FU_PLAY => &mut self.path.play_gain,
+            desc::ENTITY_FU_REC => &mut self.path.rec_gain,
+            _ => return Reply::Stall,
+        };
+        if channel != 0 || req.request != REQ_CUR {
+            return Reply::Stall;
+        }
+        match (selector, data.len()) {
+            (FU_MUTE_CONTROL, 1) => g.set_mute(data[0] != 0),
+            (FU_VOLUME_CONTROL, 2) => g.set_volume(i16::from_le_bytes([data[0], data[1]])),
+            _ => return Reply::Stall,
+        }
+        Reply::Ack
     }
 
     fn clock_get(&self, req: &Request, buf: &mut [u8]) -> Reply {
@@ -514,7 +615,7 @@ impl Audio {
             }
             (VREQ_CLEAR_STATS, false) if req.length == 0 => {
                 self.path.stats = Stats::new();
-                crate::profile::clear();
+                profile::clear();
                 Reply::Ack
             }
             // Debug. Blocks the USB ISR for the I2C transfer (~0.3 ms).
@@ -531,8 +632,8 @@ impl Audio {
                 Reply::Ack
             }
             (VREQ_DBG_ISR_STATS, true) => {
-                crate::profile::bytes(&mut buf[..crate::profile::BYTES]);
-                Reply::In(crate::profile::BYTES)
+                profile::bytes(&mut buf[..profile::BYTES]);
+                Reply::In(profile::BYTES)
             }
             _ => Reply::Stall,
         }
@@ -562,8 +663,84 @@ impl Audio {
             | (if self.alt_in != 0 { STATS_FLAG_REC_ACTIVE } else { 0 })
             | (if self.path.play.primed { STATS_FLAG_PLAY_PRIMED } else { 0 })
             | (if codec::RATES.contains(&self.path.rate) { 0 } else { STATS_FLAG_CODEC_OUT_OF_SPEC })
-            | (if self.path.loopback { STATS_FLAG_LOOPBACK } else { 0 });
+            | (if self.path.loopback { STATS_FLAG_LOOPBACK } else { 0 })
+            | (if self.path.play_gain.unity() && self.path.rec_gain.unity() { 0 } else { STATS_FLAG_GAIN });
         st[36..38].copy_from_slice(&flags.to_le_bytes());
         st[38..40].fill(0);
+    }
+}
+
+/// DFU runtime requests (interface [`ITF_DFU`]). DETACH takes effect once
+/// its status stage is done ([`Function::control_done`]).
+fn dfu_runtime(req: &Request, buf: &mut [u8]) -> Reply {
+    match (req.request, req.dir_in(), req.length) {
+        (DFU_DETACH, false, 0) => Reply::Ack,
+        (DFU_GETSTATUS, true, 6..) => {
+            // bStatus OK, bwPollTimeout 0, bState appIDLE, iString 0
+            buf[..6].copy_from_slice(&[0, 0, 0, 0, DFU_STATE_APP_IDLE, 0]);
+            Reply::In(6)
+        }
+        (DFU_GETSTATE, true, 1..) => {
+            buf[0] = DFU_STATE_APP_IDLE;
+            Reply::In(1)
+        }
+        _ => Reply::Stall,
+    }
+}
+
+/// At full speed only the vendor and DFU interfaces exist
+/// ([`desc::FS_CONFIG`]).
+fn fs_interface(itf: u8) -> bool {
+    itf == ITF_VENDOR || itf == ITF_DFU
+}
+
+impl Function for Audio {
+    fn control(&mut self, req: &Request, buf: &mut [u8], _qhs: &mut QhList) -> Reply {
+        self.setup(req, buf)
+    }
+
+    fn control_out(&mut self, req: &Request, data: &[u8]) -> Reply {
+        self.setup_out(req, data)
+    }
+
+    fn control_done(&mut self, req: &Request) {
+        if req.kind() == KIND_CLASS
+            && req.recipient() == RCPT_INTERFACE
+            && req.index as u8 == ITF_DFU
+            && req.request == DFU_DETACH
+        {
+            DETACH_REQUESTED.store(true, Ordering::Release);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.streams_off();
+    }
+
+    fn get_interface(&self, itf: u8) -> Option<u8> {
+        if self.full_speed && !fs_interface(itf) {
+            return None;
+        }
+        self.alt(itf)
+    }
+
+    fn set_interface(&mut self, itf: u8, alt: u8, qhs: &mut QhList) -> bool {
+        if self.full_speed && !fs_interface(itf) {
+            return false;
+        }
+        self.set_alt(itf, alt, qhs)
+    }
+
+    /// Link speed known. At full speed the audio interfaces don't exist.
+    fn set_full_speed(&mut self, full_speed: bool) {
+        self.full_speed = full_speed;
+    }
+
+    fn sof(&mut self, frindex: u32) {
+        self.on_sof(frindex);
+    }
+
+    fn service(&mut self, qhs: &mut QhList) {
+        self.pump(qhs);
     }
 }

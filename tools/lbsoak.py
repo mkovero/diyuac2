@@ -12,9 +12,21 @@ corrupted frame is reported with its time, and the checker resynchronises.
 """
 import random, subprocess, sys, threading, time
 
+
+def unity_mixer(card):
+    """Feature Units to 0 dB, unmuted: the host mixer (WirePlumber, alsactl)
+    may have set another level, and only 0 dB is bit-exact. Cards without
+    the controls (C firmware) are left alone."""
+    for name, val in (("PCM Playback Volume", "100%"), ("PCM Playback Switch", "on"),
+                      ("Line Capture Volume", "100%"), ("Line Capture Switch", "on")):
+        subprocess.run(["amixer", "-q", "-c", card, "cset", f"name={name}", val],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 card = sys.argv[1] if len(sys.argv) > 1 else "3"
 secs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 rate = int(sys.argv[3]) if len(sys.argv) > 3 else 192000
+unity_mixer(card)
 FRAME = 8
 block = random.Random(1234).randbytes(rate * FRAME)    # 1 s
 fmt = ["-t", "raw", "-f", "S32_LE", "-c", "2", "-r", str(rate)]

@@ -1,7 +1,7 @@
 # diyuac2 firmware, Rust port
 
 Full-Rust firmware for the MIMXRT1020-EVK, built on imxrt-rt, imxrt-ral and
-imxrt-hal. The USB device stack is our own (`src/usb/`): a ChipIdea HS
+imxrt-hal. The USB device stack is our own (`common/src/usb/`): a ChipIdea HS
 driver with isochronous dTD rings, EP0 control transfers and standard
 requests, all run from the USB_OTG1 interrupt. usb-device and imxrt-usbd were
 used for R1 and then dropped, because they cannot do high-speed iso (no QH
@@ -14,21 +14,41 @@ the verified reference; this port has to reach parity with it.
 | R2 | Own USB stack: iso OUT/IN at high speed + feedback EP, bit-exact loopback | done |
 | R3 | SAI1 + eDMA + WM8960, measured feedback; parity with M3 | done |
 
+Crates (one cargo workspace):
+
+| Crate | What |
+|---|---|
+| `.` (`diyuac2`) | the app: UAC2 + vendor + DFU runtime interfaces, audio path |
+| `boot/` (`diyuac2-boot`) | USB DFU bootloader, at the flash start |
+| `common/` (`diyuac2-common`) | USB device core, clocks, serial number, flash (ROM API), flash layout, CRC-32, ISR profile |
+
 ## Build and flash
 
 ```sh
 rustup target add thumbv7em-none-eabihf
-cargo build --release
-arm-none-eabi-objcopy -O ihex target/thumbv7em-none-eabihf/release/diyuac2 target/diyuac2.hex
-pyocd load -t mimxrt1020 -f 500000 -M under-reset target/diyuac2.hex
+cargo build --release --workspace
+R=target/thumbv7em-none-eabihf/release
+arm-none-eabi-objcopy -O binary $R/diyuac2 target/app.bin
+arm-none-eabi-objcopy -O binary $R/diyuac2-boot target/boot.bin
+
+# Over USB (the app or the bootloader must be running):
+sudo ../tools/dfu.py update target/app.bin
+
+# With a debug probe (bootloader + app + app info sector):
+../tools/mkimage.py target/app.bin target/full.hex target/boot.bin
+pyocd load -t mimxrt1020 -f 500000 -M under-reset target/full.hex
 pyocd reset -t mimxrt1020 -f 500000 -m hw    # hardware reset; no power cycle needed
 ```
+
+The app is linked for flash offset 0x40000 and cannot boot from the boot
+ROM by itself; flashing only the app with a probe also needs the info
+sector (`mkimage.py app.bin out.hex` without `boot.bin`).
 
 `.data` and `.bss` are placed in DTCM (`build.rs`), so the USB queue heads,
 dTDs and buffers are not cached and the USB DMA can reach them.
 
-The FlexSPI configuration block (`src/fcb.rs`) is a copy of the one the C
-firmware boots with.
+The FlexSPI configuration block (`boot/src/fcb.rs`) is a copy of the one
+the C firmware boots with.
 
 ## R1 results (2026-11-03, Linux host)
 
@@ -246,3 +266,148 @@ fd) removed the stale frames and cut the discontinuities from 437 to 50
 in 10 s. The rest is one zeroed frame about every 0.2 s, which matches
 the rate of 25-frame (200-byte, max size) capture packets (not verified
 per packet). Don't use VM passthrough for iso data checks.
+
+## 44.1 kHz family (2026-11-05)
+
+The clock source now offers 44.1, 48, 88.2, 96, 176.4 and 192 kHz. The
+48 kHz family runs PLL4 at 786.432 MHz, the 44.1 kHz family at
+722.5344 MHz (24 MHz x (30 + 1056/10000) = 4 x 4096 x 44.1 kHz). The SAI
+root dividers are the same in both families (16/8/4), and the PLL is
+reprogrammed only when a rate change crosses families. 44.1 kHz is within
+the WM8960 specification; 88.2 and 176.4 kHz are not (stats flag 4).
+At 44.1 and 176.4 kHz the packets alternate between two sizes
+(5/6 and 22/23 frames per microframe), so capture packets may carry the
+nominal count rounded up plus one.
+
+- `tools/loopback.py` bit-exact at all six rates, 0 counters. Feedback
+  44101.07 Hz at 44.1 kHz, +24 ppm like the 48 kHz family.
+- `tools/usbhost.py` passes at 192 kHz, with rate changes across the
+  families mid-stream (192 -> 176.4 -> 44.1 -> 192 kHz).
+- Rate switch cost in the USB ISR: 41 us within a family, about 0.49 ms
+  across families (PLL relock).
+
+Fixed on the way: `audio_hw::start()` waited for the DMA to prefill the
+TX FIFO before enabling the transmitter. The DMA does not fill it while
+the transmitter is disabled, so the wait always ran into its timeout:
+6.4 ms inside the USB ISR on every rate set. It is gone; the TX FIFO
+error counter stays 0 at stream start.
+
+Also fixed in `tools/usbhost.py`: at exit it gave the interfaces back
+one by one, so snd-usb-audio probed interface 0 while the streaming
+interfaces were still claimed, and the card came back without PCM
+devices.
+
+## Volume and mute (Feature Units, 2026-11-05)
+
+Feature Unit 0x02 sits between the playback input terminal and the line
+out, Feature Unit 0x12 between the line in and the capture output
+terminal. Each has a master mute and a master volume from -100 dB to 0 dB
+in 0.5 dB steps (UAC2 1/256 dB units). The gain is applied to the samples
+in the USB ISR (`src/gain.rs`, Q2.30 factor from a table built at compile
+time). At 0 dB, unmuted, the samples are not touched, so the path is
+bit-exact. Values out of range clamp, others round to the nearest step.
+Linux shows them as `PCM Playback Volume/Switch` and `Line Capture
+Volume/Switch`.
+
+The C firmware left the Feature Unit out so that host volume could not
+alter a measurement path. That risk is real: on ketunkolo the host mixer
+set the playback volume to -23.5 dB as soon as the card appeared. So
+any setting other than 0 dB unmuted raises stats flag bit 6 (`gain` in
+`vendorctl.py stats`), and `tools/loopback.py` and `tools/lbsoak.py` set
+both units to 0 dB before they run. The volumes power up at 0 dB and are
+not stored.
+
+- `tools/usbhost.py gain` at 192 kHz: playback and capture at -6 dB and
+  -60 dB, every captured frame equals the played counter frame scaled by
+  the firmware's factor (about 384,000 frames each, 0 mismatches). Mute
+  gives all-zero capture. The flag is set in every non-unity case and
+  clears at 0 dB, with a bit-exact stream after.
+- `tools/usbhost.py control` adds Feature Unit cases: RANGE (8 bytes),
+  wrong sizes, channel 1, unknown selectors and RANGE on mute all stall.
+
+No interrupt endpoint: UAC2 uses it to tell the host about changes the
+device makes itself, and the device makes none (rate, volume and mute
+only change on host requests).
+
+The configuration descriptor grew to 263 bytes, past the 256-byte EP0
+buffer, which would have truncated it; the buffer is 512 bytes now, with
+a compile-time check. (With the DFU interface it is 281 bytes, and the
+shared core's EP0 buffer is 4 KiB, the DFU block size.)
+
+## Firmware update over USB (DFU, 0.4.0, 2026-11-05)
+
+A small bootloader (`boot/`, 26 KiB) sits at the flash start and is never
+written over USB. The app moved to flash offset 0x40000.
+
+```text
+0x6000_0000  bootloader: FCB, IVT, code         (boot ROM starts it)
+0x6003_F000  app info sector: "D2AI", length, CRC-32, CRC of those
+0x6004_0000  app image, vector table first, up to 1 MiB
+```
+
+(`common/src/layout.rs`.) At reset the bootloader checks for a DFU request
+from the app (a magic in SRC_GPR10, which survives SYSRESETREQ and is
+cleared at power-on) and for a valid app (info sector, CRC-32 of the
+image). With no request and a valid app it jumps to the app before
+touching any clock or peripheral, so the app starts from the same state
+as from the boot ROM. Otherwise it stays in DFU mode: USB DFU 1.1, VID:PID
+cafe:0ac3, product "diyuac2 bootloader", same serial as the app, high
+speed, polled (no interrupts). LED: short flash every 500 ms.
+
+The app has a DFU runtime interface (interface 4, at both speeds, so a
+full-speed link can still be updated). DFU_DETACH makes the app leave the
+bus and reset into the bootloader.
+
+Download: each 4 KiB DNLOAD block is erased, programmed and read back in
+the OUT data stage, through the boot ROM's FlexSPI NOR driver (the ROM API
+tree, as MCUXpresso `fsl_romapi`). The first block erases the info
+sector, so an interrupted update leaves no valid app and the bootloader
+stays in DFU mode. After the final zero-length DNLOAD, GETSTATUS checks
+the vector table (stack pointer in DTCM/OCRAM, reset vector inside the
+image), compares the CRC-32 of the flash contents with the CRC-32 of the
+data received, and writes the info sector. The device is not
+manifestation tolerant: it reports dfuMANIFEST, then
+dfuMANIFEST-WAIT-RESET, and resets into the new app on the host's bus
+reset or after 3 s. Out-of-order blocks, a block after a short one,
+images over 1 MiB, UPLOAD and unknown requests end in dfuERROR with the
+matching DFU status; CLRSTATUS recovers.
+
+The boot FCB has only the read sequence in its LUT. The ROM driver needs
+read status, write enable, sector erase and page program too (with the
+boot FCB it waited forever for the status register), so the bootloader
+hands it a copy with those sequences added (`fcb::rom_config`,
+IS25LP064A opcodes, single pad).
+
+`tools/dfu.py` (Python only, usbfs) does detach, download, manifest and
+waits for the app to come back. Stock `dfu-util -d cafe:0ac2,cafe:0ac3
+-D app.bin` should work the same way; **not verified**, dfu-util is not
+installed on ketunkolo. usbguard there has an id+serial+port rule for
+cafe:0ac3 as for cafe:0ac2.
+
+Results on ketunkolo (bare metal):
+
+- `dfu.py update`: 34,816-byte app in 9 blocks, 0.7 s download, 1.7 to
+  2.2 s from the app's DETACH to the new app enumerating again at high
+  speed. Repeated several times, including while `aplay` was playing at
+  192 kHz (aplay gets ENODEV, as expected).
+- Full-speed config: a `force-full-speed` build installed by DFU came up
+  at 12 Mbit/s and was replaced by DFU through its full-speed DFU
+  interface; the normal build came back at 480.
+- Fault cases (scratch script): zero-length DNLOAD in dfuIDLE (errNOTDONE),
+  UPLOAD (errSTALLEDPKT), block 2 after block 0 (errADDRESS), random data
+  as image (errFILE at manifest), a block after a short block (stall),
+  ABORT mid-download then DETACH: comes back as the bootloader, no app.
+  All as expected, CLRSTATUS recovers each.
+- Probe path: `mkimage.py` hex (bootloader + info + app) boots the app;
+  erasing the info sector leaves the bootloader in DFU mode; hardware
+  reset with a valid app boots the app.
+- Regression at 192 kHz after the restructure: `usbhost.py all` passes,
+  `faults.sh all` passes, `loopback.py` bit-exact at all six rates.
+
+`usbhost.py` now sets both Feature Units to 0 dB at start: after any
+re-enumeration (a DFU update is one) the host mixer sets its own volume
+again, and the counter-frame checks failed on the scaled data.
+
+Not done: entering DFU mode by button (SW4) when the app is broken but
+its CRC is fine; until then the probe is the fallback for an app that
+boots but hangs before USB is up.

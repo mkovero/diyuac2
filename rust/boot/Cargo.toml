@@ -1,0 +1,18 @@
+[package]
+name = "diyuac2-boot"
+version = "0.1.0"
+edition = "2024"
+description = "diyuac2 USB DFU bootloader for the i.MX RT1020"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+imxrt-hal = { version = "0.6", features = ["imxrt1020"] }
+imxrt-ral = { version = "0.6", features = ["imxrt1021", "rt"] }
+imxrt-rt = { version = "0.1", features = ["device"] }
+panic-halt = "1"
+diyuac2-common = { path = "../common" }
+
+[build-dependencies]
+imxrt-rt = { version = "0.1", features = ["device"] }

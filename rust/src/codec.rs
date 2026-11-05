@@ -19,11 +19,10 @@ use crate::audio_hw::I2c;
 
 const ADDR: u8 = 0x1A;
 
-/// Sample rates this codec supports in the 256 fs clocking scheme, ascending.
 /// Rates within the WM8960 specification (8..48 kHz) in this clocking
-/// scheme (MCLK = 256 fs). The device also runs 96 and 192 kHz with the
-/// codec out of spec ([`crate::audio::RATES`]).
-pub const RATES: &[u32] = &[48_000];
+/// scheme (MCLK = 256 fs), ascending. The device also runs 88.2 to 192 kHz
+/// with the codec out of spec ([`crate::audio::RATES`]).
+pub const RATES: &[u32] = &[44_100, 48_000];
 
 const R_LINVOL: u8 = 0x00;
 const R_RINVOL: u8 = 0x01;

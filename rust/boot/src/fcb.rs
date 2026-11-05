@@ -42,3 +42,44 @@ pub static FLEXSPI_CONFIGURATION_BLOCK: [u8; 512] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+/// LUT instruction: `opcode` with `pads` (0 = 1 pad) and `operand`.
+const fn instr(opcode: u32, pads: u32, operand: u32) -> u32 {
+    operand | pads << 8 | opcode << 10
+}
+
+/// LUT word: two instructions.
+const fn lut(a: u32, b: u32) -> u32 {
+    a | b << 16
+}
+
+const CMD_SDR: u32 = 0x01;
+const RADDR_SDR: u32 = 0x02;
+const WRITE_SDR: u32 = 0x08;
+const READ_SDR: u32 = 0x09;
+
+/// The FCB with the LUT sequences the ROM flash driver uses for erase and
+/// program (the boot FCB has the read sequence only, so the ROM would wait
+/// forever for the status register): 1 = read status, 3 = write enable,
+/// 5 = sector erase (4 KiB), 9 = page program, 11 = chip erase. Single-pad
+/// commands, IS25LP064A opcodes (SDK `flexspi_nor` examples).
+pub fn rom_config() -> [u8; 512] {
+    let mut cfg = FLEXSPI_CONFIGURATION_BLOCK;
+    let seqs: [(usize, [u32; 2]); 5] = [
+        (1, [lut(instr(CMD_SDR, 0, 0x05), instr(READ_SDR, 0, 0x04)), 0]),
+        (3, [lut(instr(CMD_SDR, 0, 0x06), 0), 0]),
+        (5, [lut(instr(CMD_SDR, 0, 0x20), instr(RADDR_SDR, 0, 0x18)), 0]),
+        (9, [lut(instr(CMD_SDR, 0, 0x02), instr(RADDR_SDR, 0, 0x18)), lut(instr(WRITE_SDR, 0, 0x04), 0)]),
+        (11, [lut(instr(CMD_SDR, 0, 0x60), 0), 0]),
+    ];
+    for (seq, words) in seqs {
+        for (i, w) in words.iter().enumerate() {
+            let off = 0x80 + 16 * seq + 4 * i;
+            cfg[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
+    cfg
+}
+
+// The read sequence decodes as expected: quad fast read 0xEB, 24-bit address.
+const _: () = assert!(lut(instr(CMD_SDR, 0, 0xEB), instr(RADDR_SDR, 2, 0x18)) == 0x0A18_04EB);

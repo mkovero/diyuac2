@@ -4,9 +4,10 @@
 //! Port of `firmware/app/audio_hw_imxrt.c`. Register values were checked
 //! against a register dump of the running C firmware (M3).
 //!
-//! Clocking: audio PLL (PLL4) 24 MHz * (32 + 768/1000) = 786.432 MHz ->
-//! SAI1 clock root /4 /N = 256 fs, output on the SAI1_MCLK pad (codec
-//! SYSCLK). SAI1 TX is the I2S master (BCLK = 64 fs, FS = fs), RX is
+//! Clocking: audio PLL (PLL4) -> SAI1 clock root /4 /N = 256 fs, output on
+//! the SAI1_MCLK pad (codec SYSCLK). PLL4 runs at 786.432 MHz for the
+//! 48 kHz family and 722.5344 MHz for the 44.1 kHz family; it is
+//! reprogrammed when a rate change crosses families. SAI1 TX is the I2S master (BCLK = 64 fs, FS = fs), RX is
 //! synchronous to TX. The audio clock comes from the 24 MHz crystal and is
 //! independent of the USB host clock.
 //!
@@ -37,13 +38,29 @@ const RX_CH: usize = 1;
 const DMAMUX_SAI1_RX: u32 = 19;
 const DMAMUX_SAI1_TX: u32 = 20;
 
-/// Audio PLL: 24 MHz * (32 + 768/1000) = 786.432 MHz.
-const PLL4_DIV_SELECT: u32 = 32;
-const PLL4_NUM: u32 = 768;
-const PLL4_DENOM: u32 = 1000;
-/// SAI1 root = 786.432 MHz / 4 / div = 256 * rate; div = 768000 / rate.
+/// One audio PLL setting and the rates it serves.
+struct Family {
+    /// PLL4 = 24 MHz * (div_select + num / denom).
+    div_select: u32,
+    num: u32,
+    denom: u32,
+    /// SAI1 root = PLL4 / 4 / div = 256 * rate, so div = this / rate.
+    root_times_rate: u32,
+}
+
+/// 24 MHz * (32 + 768/1000) = 786.432 MHz = 4 * 4096 * 48 kHz.
+const FAMILY_48K: Family = Family { div_select: 32, num: 768, denom: 1000, root_times_rate: 768_000 };
+/// 24 MHz * (30 + 1056/10000) = 722.5344 MHz = 4 * 4096 * 44.1 kHz.
+const FAMILY_44K1: Family = Family { div_select: 30, num: 1056, denom: 10000, root_times_rate: 705_600 };
+const FAMILIES: [&Family; 2] = [&FAMILY_48K, &FAMILY_44K1];
 const SAI_PREDIVIDER: u32 = 4;
-const SAI_ROOT_TIMES_RATE: u32 = 768_000;
+/// Index into FAMILIES of the PLL4 setting in effect.
+static FAMILY: AtomicU32 = AtomicU32::new(0);
+
+fn pll4_set(f: &Family) {
+    let mut ccm_analog = unsafe { ral::ccm_analog::CCM_ANALOG::instance() };
+    ccm::analog::pll4::reconfigure(&mut ccm_analog, f.div_select, f.num, f.denom, ccm::analog::pll4::PostDivider::U1);
+}
 
 /// LPI2C1 functional clock: PLL3 / 8 (60 MHz) / 6 = 10 MHz.
 const LPI2C_DIVIDER: u32 = 6;
@@ -174,22 +191,16 @@ pub type I2c = hal::lpi2c::Lpi2c;
 /// Clocks, pins, DMA interrupts. Returns the codec I2C bus.
 pub fn init(mut pins: Pins) -> I2c {
     let mut ccm = unsafe { ral::ccm::CCM::instance() };
-    let mut ccm_analog = unsafe { ral::ccm_analog::CCM_ANALOG::instance() };
 
-    ccm::analog::pll4::reconfigure(
-        &mut ccm_analog,
-        PLL4_DIV_SELECT,
-        PLL4_NUM,
-        PLL4_DENOM,
-        ccm::analog::pll4::PostDivider::U1,
-    );
+    pll4_set(&FAMILY_48K);
+    FAMILY.store(0, Ordering::SeqCst);
 
     // Clock roots must change with their gates off.
     ccm::clock_gate::sai::<1>().set(&mut ccm, ccm::clock_gate::OFF);
     ccm::clock_gate::lpi2c::<1>().set(&mut ccm, ccm::clock_gate::OFF);
     ccm::sai_clk::set_selection::<1>(&mut ccm, ccm::sai_clk::Selection::Pll4);
     ccm::sai_clk::set_predivider::<1>(&mut ccm, SAI_PREDIVIDER);
-    ccm::sai_clk::set_divider::<1>(&mut ccm, SAI_ROOT_TIMES_RATE / 48_000);
+    ccm::sai_clk::set_divider::<1>(&mut ccm, FAMILY_48K.root_times_rate / 48_000);
     ccm::lpi2c_clk::set_selection(&mut ccm, ccm::lpi2c_clk::Selection::Pll3Div8);
     ccm::lpi2c_clk::set_divider(&mut ccm, LPI2C_DIVIDER);
     for gate in [
@@ -267,10 +278,13 @@ fn tx_fifo_fill(tfr: u32) -> u32 {
     ((tfr >> 16).wrapping_sub(tfr)) & FIFO_PTR_MASK
 }
 
-/// SAI1 root divider for a rate, if the rate is reachable at 256 fs.
-fn rate_divider(rate: u32) -> Option<u32> {
-    let d = SAI_ROOT_TIMES_RATE.checked_div(rate)?;
-    (d >= 1 && d <= 64 && d * rate == SAI_ROOT_TIMES_RATE).then_some(d)
+/// PLL family (index into FAMILIES) and SAI1 root divider for a rate, if
+/// the rate is reachable at 256 fs.
+fn rate_divider(rate: u32) -> Option<(usize, u32)> {
+    FAMILIES.iter().enumerate().find_map(|(i, f)| {
+        let d = f.root_times_rate.checked_div(rate)?;
+        (d >= 1 && d <= 64 && d * rate == f.root_times_rate).then_some((i, d))
+    })
 }
 
 pub fn stop() {
@@ -294,13 +308,18 @@ pub fn stop() {
 
 /// (Re)start the audio interface at `rate`. MCLK runs from here on.
 pub fn start(rate: u32) -> bool {
-    let Some(div) = rate_divider(rate) else {
+    let Some((family, div)) = rate_divider(rate) else {
         return false;
     };
     stop();
 
     let mut ccm = unsafe { ral::ccm::CCM::instance() };
     ccm::clock_gate::sai::<1>().set(&mut ccm, ccm::clock_gate::OFF);
+    if FAMILY.load(Ordering::SeqCst) != family as u32 {
+        // MCLK is gated off while the PLL relocks.
+        pll4_set(FAMILIES[family]);
+        FAMILY.store(family as u32, Ordering::SeqCst);
+    }
     ccm::sai_clk::set_divider::<1>(&mut ccm, div);
     ccm::clock_gate::sai::<1>().set(&mut ccm, ccm::clock_gate::ON);
 
@@ -345,12 +364,9 @@ pub fn start(rate: u32) -> bool {
     ral::write_reg!(ral::sai, sai, TCSR, CSR_FRDE);
     ral::write_reg!(ral::sai, sai, RCSR, CSR_FRDE);
 
-    // Let the DMA prefill the TX FIFO before the transmitter starts.
-    for _ in 0..100_000 {
-        if tx_fifo_fill(ral::read_reg!(ral::sai, sai, TFR[0])) > 16 {
-            break;
-        }
-    }
+    // No TX FIFO prefill here: the DMA does not fill the FIFO while the
+    // transmitter is disabled (a wait for it timed out after 6.4 ms in the
+    // USB ISR). It fills within the first frame once TE is set.
     // The synchronous receiver starts with the transmitter's first frame.
     ral::write_reg!(ral::sai, sai, RCSR, CSR_FRDE | CSR_TE | CSR_BCE);
     ral::write_reg!(ral::sai, sai, TCSR, CSR_FRDE | CSR_TE | CSR_BCE);

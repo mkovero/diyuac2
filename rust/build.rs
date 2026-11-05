@@ -1,10 +1,12 @@
 use imxrt_rt::{Family, Memory, RuntimeBuilder};
 
-/// MIMXRT1020-EVK: IS25LP064A, 8 MiB QSPI NOR.
-const FLASH_SIZE: usize = 8 * 1024 * 1024;
+/// Flash partition of the app: after the DFU bootloader (`boot/`) and the
+/// app info sector. Keep in sync with `common/src/layout.rs`.
+const APP_OFFSET: u32 = 0x4_0000;
+const APP_MAX: usize = 0x10_0000;
 
 fn main() {
-    RuntimeBuilder::from_flexspi(Family::Imxrt1020, FLASH_SIZE)
+    RuntimeBuilder::in_flash(Family::Imxrt1020, APP_MAX, APP_OFFSET)
         // USB queue heads, dTDs and buffers are statics: keep them in DTCM,
         // which the USB DMA reaches and which is never cached.
         .data(Memory::Dtcm)
