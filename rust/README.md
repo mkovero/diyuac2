@@ -379,10 +379,20 @@ hands it a copy with those sequences added (`fcb::rom_config`,
 IS25LP064A opcodes, single pad).
 
 `tools/dfu.py` (Python only, usbfs) does detach, download, manifest and
-waits for the app to come back. Stock `dfu-util -d cafe:0ac2,cafe:0ac3
--D app.bin` should work the same way; **not verified**, dfu-util is not
-installed on ketunkolo. usbguard there has an id+serial+port rule for
-cafe:0ac3 as for cafe:0ac2.
+waits for the app to come back. Stock dfu-util 0.11 works too (as root,
+or with udev rules for both IDs):
+
+```sh
+dfu-util -d cafe:0ac2,cafe:0ac3 -D app.bin -R   # update from the running app
+dfu-util -d cafe:0ac2 -e                        # app -> bootloader only
+```
+
+On ketunkolo: detach, 9 blocks, dfuMANIFEST, dfuMANIFEST-WAIT-RESET, USB
+reset, app back at high speed, exit 0, 7.3 s (dfu-util waits 1 s at
+dfuMANIFEST and polls for the re-enumeration). Without `-R` dfu-util
+still resets the bus at dfuMANIFEST-WAIT-RESET. The file has no DFU
+suffix, so dfu-util warns about it. usbguard there has an id+serial+port
+rule for cafe:0ac3 as for cafe:0ac2.
 
 Results on ketunkolo (bare metal):
 
