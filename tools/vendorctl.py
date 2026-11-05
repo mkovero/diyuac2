@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""diyuac2 vendor control interface client (draft protocol v0.2).
+"""diyuac2 vendor control interface client (draft protocol v0.3).
 
 Dependency-free: talks to the device through Linux usbfs ioctls.
 Needs write access to the device node (root, or a udev rule, see docs/vendor-protocol.md).
@@ -35,11 +35,13 @@ VREQ_DBG_ISR_STATS = 0x11
 VREQ_DBG_LOOPBACK = 0x12
 SCRATCH_SIZE = 32
 
-STATS_FMT = "<9I2H"  # vendor_stats_t, 40 bytes
+STATS_FMT = "<9I2H5I"  # vendor_stats_t, 60 bytes (40 before Rust firmware 0.4.1)
+STATS_FMT_OLD = "<9I2H"
 STATS_FIELDS = ("rate", "feedback", "play_underruns", "rec_overruns", "rec_drops",
                 "tx_fifo_errors", "rx_fifo_errors", "play_lead_min", "play_lead_max",
-                "flags", "reserved")
-FLAG_NAMES = ("codec_ok", "play", "rec", "primed", "codec_out_of_spec", "loopback", "gain")
+                "flags", "reserved",
+                "usb_out_errors", "usb_in_errors", "usb_fb_errors", "usb_out_missed", "usb_in_missed")
+FLAG_NAMES = ("codec_ok", "play", "rec", "primed", "codec_out_of_spec", "loopback", "gain", "tdm16")
 
 # bmRequestType: vendor, recipient interface
 RT_IN = 0x80 | 0x40 | 0x01
@@ -100,7 +102,8 @@ def get_info(fd):
 
 def get_stats(fd):
     raw = control(fd, RT_IN, VREQ_GET_STATS, struct.calcsize(STATS_FMT))
-    st = dict(zip(STATS_FIELDS, struct.unpack(STATS_FMT, raw)))
+    fmt = STATS_FMT if len(raw) == struct.calcsize(STATS_FMT) else STATS_FMT_OLD
+    st = dict(zip(STATS_FIELDS, struct.unpack(fmt, raw)))
     for k in ("play_lead_min", "play_lead_max"):
         if st[k] >= 1 << 31:
             st[k] -= 1 << 32
@@ -114,7 +117,9 @@ def format_stats(st):
     return (f"rate {st['rate']} fb 0x{fb:08x} = {hz:.3f} Hz ({hz - st['rate']:+.3f}) "
             f"underruns {st['play_underruns']} rec_overruns {st['rec_overruns']} "
             f"rec_drops {st['rec_drops']} sai_fifo_err tx {st['tx_fifo_errors']} rx {st['rx_fifo_errors']} "
-            f"lead {st['play_lead_min']}..{st['play_lead_max']} [{flags}]")
+            f"lead {st['play_lead_min']}..{st['play_lead_max']} [{flags}]"
+            + (f" usb err out {st['usb_out_errors']} in {st['usb_in_errors']} fb {st['usb_fb_errors']}"
+               f" missed out {st['usb_out_missed']} in {st['usb_in_missed']}" if "usb_out_errors" in st else ""))
 
 
 def main():

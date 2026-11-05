@@ -421,3 +421,124 @@ again, and the counter-frame checks failed on the scaled data.
 Not done: entering DFU mode by button (SW4) when the app is broken but
 its CRC is fine; until then the probe is the fallback for an app that
 boots but hangs before USB is up.
+
+## 16-channel TDM alt setting for soaks (0.4.1, 2026-11-05)
+
+Both streaming interfaces have an alt setting 2 with 16 channels of 32-bit
+audio (bNrChannels 16, no channel config), next to the stereo alt 1. It is
+for stress tests: 8x the USB and DMA load of stereo, with the debug
+loopback checking every bit. ALSA shows it as a second altset of the same
+PCM; `aplay -c 16` / `arecord -c 16` pick it.
+
+- USB: high-bandwidth iso, wMaxPacketSize 0x0C00 (1024 bytes, 2
+  transactions per microframe). 192 kHz needs 25 frames x 64 bytes = 1600
+  bytes per microframe. The device stack sets the QH Mult field and, for
+  IN, the dTD MultO from the packet length.
+- SAI1: TDM, 4 data lines x 4 slots x 32 bit, BCLK 128 fs (24.576 MHz at
+  192 kHz), FIFO combine mode so the eDMA moves one frame of all four lines
+  per minor loop through TDR0/RDR0. Only line 0 has a pad on the EVK and
+  the WM8960 cannot decode this format, so the analog I/O carries nothing
+  useful: alt 2 is meant for the debug loopback (`vendorctl.py loopback
+  on`).
+- Both directions share the SAI frame format. SET_INTERFACE to a format
+  that differs from the other direction while it streams is stalled
+  (e.g. capture alt 1 while playback runs alt 2).
+- The DMA rings stay 64 KiB each (16384 words): 8192 frames in stereo,
+  1024 frames at 16 channels. To fit, the FlexRAM is split ITCM 32 KiB,
+  DTCM 192 KiB, OCRAM 32 KiB (`build.rs`).
+- Word counters are u64: a u32 word count wraps every 23 minutes at
+  16 channels and 192 kHz.
+- Stats flag bit 7 (`tdm16`) is set while a stream uses alt 2.
+- Start artifacts found and fixed: the TX FIFO underflowed once at every
+  16-channel start (fixed by queuing one zero frame before TE), and the
+  short capture ring overran once while the first IN packets were armed
+  (now resynced silently during the first fills after a restart).
+
+`tools/loopback.py` and `tools/lbsoak.py` take the channel count as 4th
+argument (`loopback.py 3 10 192000 16`, `lbsoak.py 3 7200 192000 16`).
+
+Results on ketunkolo (bare metal), 192 kHz:
+
+- `loopback.py` bit-exact at 16 channels (48 and 192 kHz), and in the
+  sequence 16, 16, 2, 2, 16 (format switches back and forth): 0 underruns,
+  0 overruns, 0 FIFO errors, lead 421..426 frames.
+- USB ISR, steady state at 16 channels both ways: mean 5.90 us, max
+  9.28 us, load 13.0 % (stereo: 2.15 us, 5.4 %). The 88 us max seen
+  before clear-stats comes from stream start, not from streaming.
+- Regression in stereo: `usbhost.py all` passes (config descriptor now
+  380 bytes), `faults.sh all` passes, `loopback.py` bit-exact at all six
+  rates.
+- 2 h soak, `lbsoak.py 3 7200 192000 16`: 1,382,398,237 frames checked,
+  **1 mismatch** at 4635 s (the checker resynced 9 ms later and the rest
+  was clean). Device counters all 0 (underruns, capture overruns and drops,
+  SAI FIFO errors), and no xrun from aplay or arecord (they report xruns
+  even with `-q`). The playback lead stayed at 421..426 frames except for
+  one dip to 308, probably at the same moment. Feedback 192004.883 Hz.
+  ISR over 178 million entries: mean 5.89 us, max 9.29 us, load 14.7 %.
+  Not explained yet. Candidates: an iso packet lost on the bus in either
+  direction. The stats do not show dTD error counts, and lbsoak does not
+  report how many frames slipped, so the run cannot tell which. The stereo
+  2 h soak (2026-11-03) had no mismatch.
+
+USB error counters (vendor protocol 0.3, stats 40 -> 60 bytes), added to
+locate such glitches:
+
+- dTDs completed with an error status, per endpoint (OUT data, IN capture,
+  IN feedback). The rings counted them before but did not report them.
+- Missed microframes per data endpoint: in a stream, microframes elapsed
+  (FRINDEX) minus dTDs retired moves within a jitter band; a step above
+  the highest value seen so far is a microframe in which the host sent no
+  OUT packet or did not poll IN. It is evaluated only when new dTDs have
+  completed, because the host goes quiet a few microframes before
+  SET_INTERFACE alt 0 at every stream end (the first version counted
+  8 to 19 per stream for that).
+- `usbhost.py gap`: the host stops resubmitting for 50 ms mid-stream, so
+  its 4 ms URB queue runs dry. The device counted 372 OUT and 377/378 IN
+  missed microframes (about 46 ms x 8 expected). All other usbhost tests
+  pass with every new counter at 0, and `clean()` now requires that.
+- `lbsoak.py` reports the slip at each resync (frames lost or added) and
+  whether the bad frames were zeros.
+
+2 h soak rerun with the counters (`lbsoak.py 3 7200 192000 16`, stats
+every minute): PASS, 1,382,400,000 frames, 0 mismatches. All counters 0,
+including the new USB error and missed-microframe counters. ISR mean
+5.96 us, load 14.9 % (max 91 us at stream start).
+
+The per-minute stats showed the playback lead falling exactly one frame
+per minute, 424 to 302 over the 2 h (it would have run dry after about
+7 h). Cause: the feedback division truncated. At 16 channels it is
+d_words / 2 for a full window, so half an LSB was lost whenever d_words
+was odd: about -0.25 LSB on average, 0.03 Hz at 192 kHz. In stereo the
+division is exact (d_words * 4), which is why the stereo soak held
+422..426. The feedback now carries the remainder to the next value
+(error diffusion, `src/feedback.rs`). A 15 min 16-channel run after the
+fix held 422..424 every minute (before: about 15 frames lower by then).
+This drift probably did not cause the single mismatch of the first run
+(the lead was still near 300 frames there).
+
+2 h soak with the feedback fix (`lbsoak.py 3 7200 192000 16`): PASS,
+1,382,400,000 frames, 0 mismatches, all counters 0, playback lead
+423..424 frames in every one of the 121 per-minute samples. ISR mean
+5.95 us, load 14.85 %. Open: the ISR max was 535 us, in the transfer
+section, once somewhere in the run (start, end or mid-stream; the
+profile keeps no timestamp). Short 16/2/16-channel runs give 9 to 12 us
+in transfers and 80 to 90 us in setup (the SAI format switch), so the
+535 us has not been reproduced.
+
+`usbhost.py` now waits about 3 s after handing the device back to
+snd-usb-audio. PipeWire/WirePlumber opens the new card and sets its own
+volume a moment later; a `loopback.py` started right after usbhost set
+unity gain first, then got the host's volume and failed.
+
+`loopback.py` tail loss (host side, fixed in the tool): a 2 s run at
+44.1 kHz lost the last 8 to 10 frames of the block, on 0.4.0 too. usbmon
+showed the host never sent them: the OUT stream on the bus ends 9 frames
+before the block end, then SET_INTERFACE alt 0. On drain, snd-usb-audio
+drops the URB it is filling when the drain completes inside that
+prepare callback (`sound/usb/endpoint.c`, "can be stopped during prepare
+callback"). aplay pads only up to the next period boundary (period 5513
+frames at 44.1 kHz: 8 frames of padding for 88200 frames), so real data
+went with that URB. The same happens at 48 kHz with 8 frames of padding
+(26 to 34 frames lost) and at 192 kHz, 16 channels (103 frames).
+`loopback.py` now plays 100 ms of silence after the block; all six
+rates and the cases above pass.

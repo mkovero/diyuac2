@@ -9,15 +9,15 @@
 //! - Capture: each iso IN packet is filled straight from the SAI RX DMA ring.
 //! - Feedback: measured from the SAI transmitter at SOF ([`crate::feedback`]).
 
-use crate::audio_hw::{self, CHANNELS, RING_FRAMES};
+use crate::audio_hw::{self, RING_WORDS};
 use crate::codec::{self, Codec};
 use crate::feedback::Feedback;
 use crate::gain::{self, Gain};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::usb::descriptors::{
-    self as desc, EP_AUDIO, EP_CAPTURE, EP_SIZE, FB_SIZE, FRAME_BYTES, ITF_AC, ITF_AS_IN, ITF_AS_OUT,
-    ITF_DFU, ITF_VENDOR,
+    self as desc, BYTES_PER_SAMPLE, EP_AUDIO, EP_CAPTURE, EP_SIZE, EP_SIZE_16CH, EP_MULT_16CH, FB_SIZE, ITF_AC,
+    ITF_AS_IN, ITF_AS_OUT, ITF_DFU, ITF_VENDOR, ISO_BUF_SIZE,
 };
 use crate::usb::hw::{IsoRing, QhList};
 use crate::usb::{Function, KIND_CLASS, KIND_VENDOR, RCPT_INTERFACE, Reply, Request};
@@ -43,10 +43,11 @@ const FU_MUTE_CONTROL: u8 = 0x01;
 const FU_VOLUME_CONTROL: u8 = 0x02;
 
 // Vendor protocol (docs/vendor-protocol.md)
-const VENDOR_PROTO_VERSION: (u8, u8) = (0, 2);
+const VENDOR_PROTO_VERSION: (u8, u8) = (0, 3);
 /// 0.3.x = Rust port. 0.3.2: R3 (SAI + WM8960, measured feedback).
 /// 0.3.3: 44.1 kHz family, Feature Units (digital volume/mute).
-const FW_VERSION: (u8, u8, u8) = (0, 4, 0);
+/// 0.4.0: DFU. 0.4.1: alt 2, 16 channels (SAI TDM, high-bandwidth iso).
+const FW_VERSION: (u8, u8, u8) = (0, 4, 1);
 /// Same as the C firmware: commands beyond the transport test are drafts.
 const INFO_FLAG_STUB: u16 = 0x0001;
 /// The link is full speed: the audio function is not offered.
@@ -57,6 +58,8 @@ const VREQ_GET_SCRATCH: u8 = 0x01;
 const VREQ_SET_SCRATCH: u8 = 0x02;
 const VREQ_GET_STATS: u8 = 0x03;
 const VREQ_CLEAR_STATS: u8 = 0x04;
+/// vendor_stats_t: 40 bytes up to 0.4.1, then USB error counters.
+const STATS_LEN: usize = 60;
 const VREQ_DBG_CODEC_WRITE: u8 = 0x10;
 const VREQ_DBG_ISR_STATS: u8 = 0x11;
 const VREQ_DBG_LOOPBACK: u8 = 0x12;
@@ -79,26 +82,31 @@ const STATS_FLAG_CODEC_OUT_OF_SPEC: u16 = 1 << 4;
 const STATS_FLAG_GAIN: u16 = 1 << 6;
 /// Debug loopback: capture carries the playback data back (DBG_LOOPBACK).
 const STATS_FLAG_LOOPBACK: u16 = 1 << 5;
+/// The SAI runs the 16-channel TDM format (alt 2): the codec gets no
+/// usable signal.
+const STATS_FLAG_TDM16: u16 = 1 << 7;
 
-/// dTDs per data endpoint ring.
+/// dTDs per data endpoint ring: OUT keeps all queued, IN keeps IN_DEPTH.
 const RING_TDS: usize = 8;
+const IN_TDS: usize = 4;
 /// Capture packets queued ahead of the host (microframes of latency).
 const IN_DEPTH: usize = 2;
 
-const RING_MASK: u32 = RING_FRAMES as u32 - 1;
+/// Smallest ring, in frames (16 channels).
+const MIN_RING_FRAMES: u32 = (RING_WORDS / 16) as u32;
 /// Playback frames written ahead of the DMA fetch position never come closer
 /// than GUARD (the DMA runs up to a FIFO watermark ahead of the SAI) and
 /// never further than MAX_LEAD.
 const PLAY_GUARD: u32 = 16;
-const PLAY_MAX_LEAD: u32 = RING_FRAMES as u32 / 2;
+const PLAY_MAX_LEAD: u32 = 768;
 /// Playback starts this far ahead of the DMA: 2 ms at the stream rate.
 const PLAY_PRIME_MS: u32 = 2;
 /// Played frames are zeroed this far behind the DMA, so the debug loopback
 /// can still read them. Silence on starvation still holds: the frames the
 /// DMA reaches after the writer are a ring lap old, and with
 /// lead <= PLAY_MAX_LEAD they are more than ZERO_LAG behind.
-const ZERO_LAG: u32 = 512;
-const _: () = assert!(PLAY_MAX_LEAD + ZERO_LAG <= RING_FRAMES as u32);
+const ZERO_LAG: u32 = 256;
+const _: () = assert!(PLAY_MAX_LEAD + ZERO_LAG <= MIN_RING_FRAMES);
 
 struct Stats {
     play_underruns: u32,
@@ -142,10 +150,14 @@ struct Play {
 /// closures can borrow it while the rings are borrowed too.
 struct Path {
     rate: u32,
+    /// Channels per frame, both directions (the SAI format).
+    channels: usize,
     play: Play,
     /// Next frame position to read from the RX ring.
     rec_rd: u32,
     rec_restart: bool,
+    /// Capture packets filled since the restart.
+    rec_fills: u32,
     /// Debug: capture reads the TX ring (what the SAI sent) instead of RX.
     loopback: bool,
     /// Feature Units 0x02 (playback) and 0x12 (capture).
@@ -158,6 +170,14 @@ impl Path {
     fn restart(&mut self) {
         self.play = Play { wr: 0, zeroed: audio_hw::tx_frames_fetched(), primed: false, starved: false };
         self.rec_restart = true;
+    }
+
+    fn frame_bytes(&self) -> usize {
+        self.channels * BYTES_PER_SAMPLE
+    }
+
+    fn ring_mask(&self) -> u32 {
+        (RING_WORDS / self.channels) as u32 - 1
     }
 
     /// Frames per microframe at the current rate, rounded down.
@@ -191,11 +211,12 @@ impl Path {
             return;
         }
         let ring = audio_hw::tx_ring();
-        let mut pos = end.wrapping_sub(end.wrapping_sub(self.play.zeroed).min(RING_FRAMES as u32));
+        let (ch, frames) = (self.channels, RING_WORDS / self.channels);
+        let mut pos = end.wrapping_sub(end.wrapping_sub(self.play.zeroed).min(frames as u32));
         while pos != end {
-            let i = (pos & RING_MASK) as usize;
-            let chunk = (end.wrapping_sub(pos) as usize).min(RING_FRAMES - i);
-            ring[i * CHANNELS..(i + chunk) * CHANNELS].fill(0);
+            let i = (pos & self.ring_mask()) as usize;
+            let chunk = (end.wrapping_sub(pos) as usize).min(frames - i);
+            ring[i * ch..(i + chunk) * ch].fill(0);
             pos = pos.wrapping_add(chunk as u32);
         }
         self.play.zeroed = end;
@@ -203,7 +224,7 @@ impl Path {
 
     /// One playback packet into the TX ring.
     fn play_packet(&mut self, data: &[u8]) {
-        let frames = (data.len() / FRAME_BYTES) as u32;
+        let frames = (data.len() / self.frame_bytes()) as u32;
         if frames == 0 {
             return;
         }
@@ -231,9 +252,10 @@ impl Path {
         let ring = audio_hw::tx_ring();
         let mut src = data.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
         let unity = self.play_gain.unity();
+        let (ch, mask) = (self.channels, self.ring_mask());
         for _ in 0..frames {
-            let i = (self.play.wr & RING_MASK) as usize * CHANNELS;
-            for c in 0..CHANNELS {
+            let i = (self.play.wr & mask) as usize * ch;
+            for c in 0..ch {
                 let s = src.next().unwrap_or(0);
                 ring[i + c] = if unity { s } else { self.play_gain.apply(s) };
             }
@@ -253,29 +275,101 @@ impl Path {
         let nominal = self.frames_per_uframe();
         if self.rec_restart {
             self.rec_restart = false;
+            self.rec_fills = 0;
             self.rec_rd = wr.wrapping_sub(nominal);
         }
+        self.rec_fills = self.rec_fills.saturating_add(1);
         let mut n = wr.wrapping_sub(self.rec_rd);
-        if n > RING_FRAMES as u32 - PLAY_GUARD {
+        // The first IN_DEPTH packets are filled when the alt setting is
+        // selected; the host may start polling later than the ring lasts
+        // (5 ms at 16 channels, 192 kHz). Resync without counting.
+        if n > self.ring_mask() + 1 - PLAY_GUARD && self.rec_fills <= IN_DEPTH as u32 + 1 {
+            self.rec_rd = wr.wrapping_sub(nominal);
+            n = nominal;
+        }
+        if n > self.ring_mask() + 1 - PLAY_GUARD {
             self.stats.rec_overruns = self.stats.rec_overruns.wrapping_add(1);
             self.rec_rd = wr.wrapping_sub(nominal);
             n = nominal;
         }
         // Normally `nominal` or one more; never more than fits a packet.
-        let take = n.min(self.max_frames_per_uframe()).min((EP_SIZE / FRAME_BYTES) as u32);
+        let take = n.min(self.max_frames_per_uframe()).min((buf.len() / self.frame_bytes()) as u32);
         let ring: &[u32] = if self.loopback { audio_hw::tx_ring() } else { audio_hw::rx_ring() };
         let unity = self.rec_gain.unity();
+        let (ch, mask) = (self.channels, self.ring_mask());
         for f in 0..take as usize {
-            let i = (self.rec_rd & RING_MASK) as usize * CHANNELS;
-            for c in 0..CHANNELS {
-                let o = (f * CHANNELS + c) * 4;
+            let i = (self.rec_rd & mask) as usize * ch;
+            for c in 0..ch {
+                let o = (f * ch + c) * 4;
                 let s = ring[i + c];
                 let s = if unity { s } else { self.rec_gain.apply(s) };
                 buf[o..o + 4].copy_from_slice(&s.to_le_bytes());
             }
             self.rec_rd = self.rec_rd.wrapping_add(1);
         }
-        take as usize * FRAME_BYTES
+        take as usize * self.frame_bytes()
+    }
+}
+
+/// Microframes in which an iso data endpoint (bInterval 1) saw no
+/// transaction inside a stream: the host did not send an OUT packet or did
+/// not poll IN. Per stream, `microframes elapsed - dTDs retired` stays in a
+/// small jitter band (a completion may be serviced after the SOF). It is
+/// evaluated only at SOFs where new dTDs have completed, so the host's
+/// silence before the stream stops does not count; each step above the
+/// highest value seen so far is a missed microframe. Counting starts at the
+/// first completion and settles for SETTLE completions.
+struct MissCounter {
+    running: bool,
+    last_frindex: u32,
+    elapsed: u32,
+    done0: u32,
+    last_n: u32,
+    dmax: i32,
+    missed: u32,
+}
+
+impl MissCounter {
+    const SETTLE: u32 = 64;
+
+    const fn new() -> Self {
+        MissCounter { running: false, last_frindex: 0, elapsed: 0, done0: 0, last_n: 0, dmax: i32::MIN, missed: 0 }
+    }
+
+    /// Stream start: `done` is the ring's retired count now.
+    fn start(&mut self, done: u32) {
+        self.running = false;
+        self.done0 = done;
+        self.last_n = 0;
+        self.dmax = i32::MIN;
+    }
+
+    fn sof(&mut self, frindex: u32, done: u32) {
+        let n = done.wrapping_sub(self.done0);
+        if !self.running {
+            if n == 0 {
+                return;
+            }
+            self.running = true;
+            self.last_frindex = frindex;
+            self.elapsed = n;
+        }
+        // FRINDEX counts microframes in 14 bits; robust to a missed SOF IRQ.
+        self.elapsed = self.elapsed.wrapping_add(frindex.wrapping_sub(self.last_frindex) & 0x3FFF);
+        self.last_frindex = frindex;
+        if n == self.last_n {
+            return;
+        }
+        self.last_n = n;
+        let d = self.elapsed.wrapping_sub(n) as i32;
+        if n < Self::SETTLE || self.dmax == i32::MIN {
+            self.dmax = self.dmax.max(d);
+            return;
+        }
+        if d > self.dmax {
+            self.missed = self.missed.wrapping_add((d - self.dmax) as u32);
+            self.dmax = d;
+        }
     }
 }
 
@@ -284,10 +378,12 @@ pub struct Audio {
     alt_in: u8,
     // The rings hold the dTDs and buffers the controller works on: they
     // live in the USB static and must never be moved.
-    out_ring: IsoRing<RING_TDS, EP_SIZE>,
+    out_ring: IsoRing<RING_TDS, ISO_BUF_SIZE>,
     fb_ring: IsoRing<2, FB_SIZE>,
-    in_ring: IsoRing<RING_TDS, EP_SIZE>,
+    in_ring: IsoRing<IN_TDS, ISO_BUF_SIZE>,
     path: Path,
+    out_miss: MissCounter,
+    in_miss: MissCounter,
     feedback: Feedback,
     codec: Option<Codec>,
     codec_ok: bool,
@@ -305,14 +401,18 @@ impl Audio {
             in_ring: IsoRing::new(EP_CAPTURE, true),
             path: Path {
                 rate: DEFAULT_RATE,
+                channels: 2,
                 play: Play { wr: 0, zeroed: 0, primed: false, starved: false },
                 rec_rd: 0,
                 rec_restart: true,
+                rec_fills: 0,
                 loopback: false,
                 play_gain: Gain::new(),
                 rec_gain: Gain::new(),
                 stats: Stats::new(),
             },
+            out_miss: MissCounter::new(),
+            in_miss: MissCounter::new(),
             feedback: Feedback::new(DEFAULT_RATE),
             codec: None,
             codec_ok: false,
@@ -334,7 +434,7 @@ impl Audio {
         if rate == self.path.rate {
             return true;
         }
-        if !audio_hw::start(rate) {
+        if !audio_hw::start(rate, self.path.channels) {
             return false;
         }
         if self.codec_ok
@@ -344,7 +444,7 @@ impl Audio {
         }
         self.path.rate = rate;
         self.path.restart();
-        self.feedback.reset(rate);
+        self.feedback.reset(rate, self.path.channels);
         true
     }
 
@@ -361,6 +461,26 @@ impl Audio {
         self.alt_in = 0;
         self.path.play.primed = false;
         self.path.play.starved = false;
+    }
+
+    /// Switch the SAI format for streaming alt setting `alt` (1: 2
+    /// channels, 2: 16). Both directions share the format: refused while
+    /// the other direction (`other_alt`) streams in a different one.
+    fn set_format(&mut self, alt: u8, other_alt: u8) -> bool {
+        let channels = alt_channels(alt);
+        if channels == self.path.channels {
+            return true;
+        }
+        if other_alt != 0 && alt_channels(other_alt) != channels {
+            return false;
+        }
+        if !audio_hw::start(self.path.rate, channels) {
+            return false;
+        }
+        self.path.channels = channels;
+        self.path.restart();
+        self.feedback.reset(self.path.rate, channels);
+        true
     }
 
     fn alt(&self, itf: u8) -> Option<u8> {
@@ -385,14 +505,19 @@ impl Audio {
                 self.path.play.starved = false;
                 true
             }
-            (ITF_AS_OUT, 1) => {
-                self.alt_out = 1;
+            (ITF_AS_OUT, 1 | 2) => {
+                if !self.set_format(alt, self.alt_in) {
+                    return false;
+                }
+                self.alt_out = alt;
                 self.path.play.primed = false;
                 self.path.play.starved = false;
                 self.path.stats.lead_reset();
-                self.feedback.reset(self.path.rate);
-                self.out_ring.start_out(qhs);
-                self.fb_ring.start_in(qhs, FB_SIZE as u16);
+                self.feedback.reset(self.path.rate, self.path.channels);
+                let (max_packet, mult) = alt_packets(alt);
+                self.out_ring.start_out(qhs, max_packet, mult);
+                self.out_miss.start(self.out_ring.completed);
+                self.fb_ring.start_in(qhs, FB_SIZE as u16, 1);
                 self.pump(qhs);
                 true
             }
@@ -403,10 +528,15 @@ impl Audio {
                 self.alt_in = 0;
                 true
             }
-            (ITF_AS_IN, 1) => {
-                self.alt_in = 1;
+            (ITF_AS_IN, 1 | 2) => {
+                if !self.set_format(alt, self.alt_out) {
+                    return false;
+                }
+                self.alt_in = alt;
                 self.path.rec_restart = true;
-                self.in_ring.start_in(qhs, EP_SIZE as u16);
+                let (max_packet, mult) = alt_packets(alt);
+                self.in_ring.start_in(qhs, max_packet, mult);
+                self.in_miss.start(self.in_ring.completed);
                 self.pump(qhs);
                 true
             }
@@ -420,6 +550,10 @@ impl Audio {
         self.path.sof();
         if self.alt_out != 0 {
             self.feedback.sof(frindex, audio_hw::tx_words_played);
+            self.out_miss.sof(frindex, self.out_ring.completed);
+        }
+        if self.alt_in != 0 {
+            self.in_miss.sof(frindex, self.in_ring.completed);
         }
     }
 
@@ -610,11 +744,16 @@ impl Audio {
                 }
             }
             (VREQ_GET_STATS, true) => {
-                self.stats_bytes(&mut buf[..40]);
-                Reply::In(40)
+                self.stats_bytes(&mut buf[..STATS_LEN]);
+                Reply::In(STATS_LEN)
             }
             (VREQ_CLEAR_STATS, false) if req.length == 0 => {
                 self.path.stats = Stats::new();
+                self.out_ring.errors = 0;
+                self.in_ring.errors = 0;
+                self.fb_ring.errors = 0;
+                self.out_miss.missed = 0;
+                self.in_miss.missed = 0;
                 profile::clear();
                 Reply::Ack
             }
@@ -639,7 +778,7 @@ impl Audio {
         }
     }
 
-    /// vendor_stats_t (40 bytes, docs/vendor-protocol.md).
+    /// vendor_stats_t (STATS_LEN bytes, docs/vendor-protocol.md).
     fn stats_bytes(&self, st: &mut [u8]) {
         let s = &self.path.stats;
         let (lead_min, lead_max) =
@@ -664,9 +803,20 @@ impl Audio {
             | (if self.path.play.primed { STATS_FLAG_PLAY_PRIMED } else { 0 })
             | (if codec::RATES.contains(&self.path.rate) { 0 } else { STATS_FLAG_CODEC_OUT_OF_SPEC })
             | (if self.path.loopback { STATS_FLAG_LOOPBACK } else { 0 })
+            | (if self.path.channels == 16 { STATS_FLAG_TDM16 } else { 0 })
             | (if self.path.play_gain.unity() && self.path.rec_gain.unity() { 0 } else { STATS_FLAG_GAIN });
         st[36..38].copy_from_slice(&flags.to_le_bytes());
         st[38..40].fill(0);
+        let usb = [
+            self.out_ring.errors,
+            self.in_ring.errors,
+            self.fb_ring.errors,
+            self.out_miss.missed,
+            self.in_miss.missed,
+        ];
+        for (i, w) in usb.iter().enumerate() {
+            st[40 + 4 * i..44 + 4 * i].copy_from_slice(&w.to_le_bytes());
+        }
     }
 }
 
@@ -743,4 +893,15 @@ impl Function for Audio {
     fn service(&mut self, qhs: &mut QhList) {
         self.pump(qhs);
     }
+}
+
+/// Channels of a streaming alt setting (both directions): alt 1 is the
+/// 2-channel codec format, alt 2 the 16-channel TDM debug format.
+fn alt_channels(alt: u8) -> usize {
+    if alt == 2 { 16 } else { 2 }
+}
+
+/// Iso max packet and transactions per microframe of a streaming alt.
+fn alt_packets(alt: u8) -> (u16, u32) {
+    if alt == 2 { (EP_SIZE_16CH as u16, EP_MULT_16CH as u32) } else { (EP_SIZE as u16, 1) }
 }

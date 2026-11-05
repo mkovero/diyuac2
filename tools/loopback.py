@@ -2,11 +2,11 @@
 """Bit-exact loopback test for diyuac2 (playback looped into capture: R2
 firmware, or the Rust firmware with `vendorctl.py loopback on`).
 
-  loopback.py [card] [secs] [rate]
+  loopback.py [card] [secs] [rate] [channels]
 
-Plays N seconds of random 32-bit stereo frames on hw:CARD and records at the
-same time, then searches the recording for the played block and compares it
-byte for byte.
+Plays N seconds of random 32-bit frames (2 channels, or 16 for the Rust
+firmware's TDM alt setting) on hw:CARD and records at the same time, then
+searches the recording for the played block and compares it byte for byte.
 """
 import os, random, subprocess, sys, time
 
@@ -24,14 +24,20 @@ def unity_mixer(card):
 card = sys.argv[1] if len(sys.argv) > 1 else "3"
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
 rate = int(sys.argv[3]) if len(sys.argv) > 3 else 48000
+ch = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 unity_mixer(card)
-ch, bps = 2, 4
+bps = 4
 frame = ch * bps
 n = int(secs * rate)
 rnd = random.Random(1234)
 data = rnd.randbytes(n * frame)
 play, rec = "/tmp/lb_play.raw", "/tmp/lb_rec.raw"
-open(play, "wb").write(data)
+# 100 ms of silence after the block: on drain, snd-usb-audio drops the URB
+# being filled when the drain completes (sound/usb/endpoint.c, "can be
+# stopped during prepare callback"), so the last frames before the end are
+# never sent. aplay pads only up to the next period boundary, which can be a
+# few frames. The silence takes the loss; only the block is compared.
+open(play, "wb").write(data + bytes(rate // 10 * frame))
 fmt = ["-t", "raw", "-f", "S32_LE", "-c", str(ch), "-r", str(rate)]
 r = subprocess.Popen(["arecord", "-q", "-D", f"hw:{card},0", *fmt, "-d", str(int(secs + 3)), rec])
 time.sleep(1.0)
@@ -39,7 +45,7 @@ p = subprocess.run(["aplay", "-q", "-D", f"hw:{card},0", *fmt, play])
 r.wait()
 got = open(rec, "rb").read()
 print(f"aplay rc={p.returncode} arecord rc={r.returncode} recorded {len(got)//frame} frames")
-off = got.find(data[:64])
+off = got.find(data[:256])
 if off < 0:
     print("FAIL: start of played block not found in recording")
     sys.exit(1)

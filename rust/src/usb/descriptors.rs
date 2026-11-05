@@ -8,8 +8,10 @@
 //!            Playback: IT 0x01 (USB streaming, 2ch) -> FU 0x02 -> OT 0x03 (line out)
 //!            Capture:  IT 0x11 (line in, 2ch)       -> FU 0x12 -> OT 0x13 (USB streaming)
 //!   itf 1  Audio Streaming OUT: alt 0 idle, alt 1 2ch 24-in-32,
+//!          alt 2 16ch 24-in-32 (debug, SAI TDM, high-bandwidth iso),
 //!          iso OUT EP 0x01 (async) + explicit feedback iso IN EP 0x81
-//!   itf 2  Audio Streaming IN: alt 0 idle, alt 1 2ch 24-in-32, iso IN EP 0x82 (async)
+//!   itf 2  Audio Streaming IN: alt 0 idle, alt 1 2ch, alt 2 16ch, iso IN
+//!          EP 0x82 (async)
 //! itf 3  Vendor control interface (class 0xFF, no endpoints), see
 //!        docs/vendor-protocol.md
 //! itf 4  DFU runtime (class 0xFE/1/1): DFU_DETACH restarts into the
@@ -46,11 +48,18 @@ pub const ENTITY_FU_REC: u8 = 0x12;
 pub const EP_AUDIO: usize = 1;
 pub const EP_CAPTURE: usize = 2;
 
-pub const N_CHANNELS: usize = 2;
 pub const BYTES_PER_SAMPLE: usize = 4;
-pub const FRAME_BYTES: usize = N_CHANNELS * BYTES_PER_SAMPLE;
-/// Iso packet size: (192000 / 8000 + 1) * 4 * 2 = 200 bytes per microframe.
-pub const EP_SIZE: usize = (192_000 / 8000 + 1) * FRAME_BYTES;
+/// Alt 1, 2 channels: (192000 / 8000 + 1) * 4 * 2 = 200 bytes per microframe.
+pub const EP_SIZE: usize = (192_000 / 8000 + 1) * 2 * BYTES_PER_SAMPLE;
+/// Alt 2, 16 channels: 25 frames of 64 bytes = 1600 bytes per microframe,
+/// as two transactions of up to 1024 bytes (high bandwidth).
+pub const EP_SIZE_16CH: usize = 1024;
+pub const EP_MULT_16CH: usize = 2;
+const _: () = assert!((192_000 / 8000 + 1) * 16 * BYTES_PER_SAMPLE <= EP_SIZE_16CH * EP_MULT_16CH);
+/// wMaxPacketSize of alt 2: size | (additional transactions << 11).
+const EP_WMAX_16CH: u16 = EP_SIZE_16CH as u16 | ((EP_MULT_16CH as u16 - 1) << 11);
+/// Iso dTD buffer: one microframe of either alt.
+pub const ISO_BUF_SIZE: usize = EP_SIZE_16CH * EP_MULT_16CH;
 pub const FB_SIZE: usize = 4;
 
 pub const STR_MANUFACTURER: u8 = 1;
@@ -97,13 +106,13 @@ pub const FS_CONFIG: [u8; 36] = [
 
 pub const CONFIG_VALUE: u8 = 1;
 
-const CONFIG_LEN: u16 = 281;
+const CONFIG_LEN: u16 = 380;
 const EP_SIZE_LO: u8 = EP_SIZE as u8;
 const EP_SIZE_HI: u8 = (EP_SIZE >> 8) as u8;
 
 #[rustfmt::skip]
 pub const CONFIG: [u8; CONFIG_LEN as usize] = [
-    // Configuration: 281 bytes, 5 interfaces, value 1, self powered, 0 mA
+    // Configuration: 380 bytes, 5 interfaces, value 1, self powered, 0 mA
     9, 0x02, CONFIG_LEN as u8, (CONFIG_LEN >> 8) as u8, 5, CONFIG_VALUE, 0, 0xC0, 0,
     // IAD: interfaces 0..2, audio, IP version 2.0
     8, 0x0B, ITF_AC, 3, 0x01, 0x00, 0x20, 0,
@@ -140,6 +149,15 @@ pub const CONFIG: [u8; CONFIG_LEN as usize] = [
     8, 0x25, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00,
     // EP 0x81 IN iso feedback, 4 bytes, every 2^(4-1) = 8 microframes
     7, 0x05, 0x81, 0x11, FB_SIZE as u8, 0, 4,
+    // Interface 1 alt 2: playback 16ch (debug), 2 endpoints
+    9, 0x04, ITF_AS_OUT, 2, 2, 0x01, 0x02, 0x20, 0,
+    // CS AS general: terminal 0x01, type I PCM, 16ch, no spatial positions
+    16, 0x24, 0x01, 0x01, 0x00, 0x01, 0x01, 0, 0, 0, 16, 0, 0, 0, 0, 0,
+    6, 0x24, 0x02, 0x01, BYTES_PER_SAMPLE as u8, 24,
+    // EP 0x01 OUT iso async data, 2 x 1024 bytes per microframe
+    7, 0x05, 0x01, 0x05, EP_WMAX_16CH as u8, (EP_WMAX_16CH >> 8) as u8, 1,
+    8, 0x25, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00,
+    7, 0x05, 0x81, 0x11, FB_SIZE as u8, 0, 4,
 
     // Interface 2 alt 0: capture, zero bandwidth
     9, 0x04, ITF_AS_IN, 0, 0, 0x01, 0x02, 0x20, 0,
@@ -152,6 +170,13 @@ pub const CONFIG: [u8; CONFIG_LEN as usize] = [
     // EP 0x82 IN iso async data, 200 bytes, every microframe
     7, 0x05, 0x82, 0x05, EP_SIZE_LO, EP_SIZE_HI, 1,
     // CS iso data EP
+    8, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Interface 2 alt 2: capture 16ch (debug), 1 endpoint
+    9, 0x04, ITF_AS_IN, 2, 1, 0x01, 0x02, 0x20, 0,
+    16, 0x24, 0x01, 0x13, 0x00, 0x01, 0x01, 0, 0, 0, 16, 0, 0, 0, 0, 0,
+    6, 0x24, 0x02, 0x01, BYTES_PER_SAMPLE as u8, 24,
+    // EP 0x82 IN iso async data, 2 x 1024 bytes per microframe
+    7, 0x05, 0x82, 0x05, EP_WMAX_16CH as u8, (EP_WMAX_16CH >> 8) as u8, 1,
     8, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 
     // Interface 3: vendor control, string 5

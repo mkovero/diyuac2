@@ -1,6 +1,6 @@
 # diyuac2 vendor control protocol
 
-Status: **draft v0.2, transport + diagnostics.** The command set (range, mute,
+Status: **draft v0.3, transport + diagnostics.** The command set (range, mute,
 generator, input type/fault status, calibration, serial) is designed in M4.
 Only the transport and a version query exist now.
 
@@ -25,14 +25,14 @@ Only the transport and a version query exist now.
   SUBSYSTEM=="usb", ATTRS{idVendor}=="cafe", ATTRS{idProduct}=="0ac2", MODE="0660", TAG+="uaccess"
   ```
 
-## Commands (v0.2)
+## Commands (v0.3)
 
 | bRequest | Name | Dir | wLength | Data |
 |---|---|---|---|---|
 | 0x00 | GET_INFO | IN | 8 | `vendor_info_t` |
 | 0x01 | GET_SCRATCH | IN | 32 | scratch buffer |
 | 0x02 | SET_SCRATCH | OUT | 1..32 | new scratch contents (rest zero-filled) |
-| 0x03 | GET_STATS | IN | 40 | `vendor_stats_t` (v0.2) |
+| 0x03 | GET_STATS | IN | 60 | `vendor_stats_t` (v0.2: 40 bytes; v0.3: 60, USB error counters added) |
 | 0x04 | CLEAR_STATS | OUT | 0 | zero counters, reset lead min/max (v0.2) |
 
 `vendor_info_t` (8 bytes):
@@ -71,7 +71,9 @@ DBG_ISR_STATS data (little endian, cycles of the core clock):
 | 28 | 8 | cycles elapsed since the profile was cleared |
 | 36 | 4 | core clock, Hz |
 
-`vendor_stats_t` (40 bytes, diagnostics for soak tests):
+`vendor_stats_t` (60 bytes, diagnostics for soak tests; 40 bytes, up to
+offset 38, before Rust firmware 0.4.1. The device returns at most wLength
+bytes, so a 40-byte request still works):
 
 | Offset | Size | Field |
 |---|---|---|
@@ -84,12 +86,24 @@ DBG_ISR_STATS data (little endian, cycles of the core clock):
 | 24 | 4 | SAI RX FIFO errors |
 | 28 | 4 | playback lead minimum, frames (int32) |
 | 32 | 4 | playback lead maximum, frames (int32) |
-| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed, 4 rate outside the codec's specification (Rust firmware: 88.2 to 192 kHz on the WM8960), 5 debug loopback on, 6 a Feature Unit is muted or not at 0 dB (the path is not bit-exact; Rust firmware 0.3.3+) |
+| 36 | 2 | flags: bit 0 codec OK, 1 playback active, 2 capture active, 3 playback primed, 4 rate outside the codec's specification (Rust firmware: 88.2 to 192 kHz on the WM8960), 5 debug loopback on, 6 a Feature Unit is muted or not at 0 dB (the path is not bit-exact; Rust firmware 0.3.3+), 7 streaming in the 16-channel TDM format (alt setting 2; Rust firmware 0.4.1+) |
 | 38 | 2 | reserved (0) |
+| 40 | 4 | USB OUT data dTDs completed with an error status (halted, data buffer or transaction error) |
+| 44 | 4 | USB IN capture dTDs completed with an error status |
+| 48 | 4 | USB IN feedback dTDs completed with an error status |
+| 52 | 4 | microframes with no OUT data packet from the host (missed iso slots: data the host never sent) |
+| 56 | 4 | microframes in which the host did not poll the capture endpoint |
 
 Playback lead is how far the firmware has written into the TX ring ahead of
 the DMA. A stable range during a long run means the feedback matches the
 audio clock. The range is reset at each playback stream start.
+
+The missed-microframe counters (52, 56) compare, per stream, the
+microframes elapsed (FRINDEX) with the dTDs retired on the endpoint
+(bInterval 1). The difference moves within a small jitter band; each step
+above the highest value seen so far counts as a missed microframe.
+Counting starts at the stream's first completed packet. CLEAR_STATS
+resets all counters.
 
 ## Versioning
 

@@ -65,6 +65,8 @@ const QH_CAP_MULT_SHIFT: u32 = 30;
 const TD_TERMINATE: u32 = 1;
 const TD_TOTAL_SHIFT: u32 = 16;
 const TD_TOTAL_MASK: u32 = 0x7FFF;
+/// MultO: transmit iso packets in this microframe (0 = the QH's Mult).
+const TD_MULTO_SHIFT: u32 = 10;
 pub const TD_IOC: u32 = 1 << 15;
 pub const TD_ACTIVE: u32 = 1 << 7;
 pub const TD_HALTED: u32 = 1 << 6;
@@ -169,6 +171,12 @@ impl Td {
     /// Arm for a transfer of `len` bytes at `buf` (DMA address), with
     /// interrupt on completion. The dTD is the end of its list.
     pub fn arm(&mut self, buf: *const u8, len: usize) {
+        self.arm_iso(buf, len, 0);
+    }
+
+    /// As [`Td::arm`], with the multiplier override for a high-bandwidth
+    /// iso IN dTD (`multo` packets; 0 = the QH's Mult).
+    pub fn arm_iso(&mut self, buf: *const u8, len: usize, multo: u32) {
         let addr = buf as u32;
         unsafe {
             write_volatile(addr_of_mut!(self.next), TD_TERMINATE);
@@ -178,7 +186,7 @@ impl Td {
             }
             write_volatile(
                 addr_of_mut!(self.token),
-                ((len as u32 & TD_TOTAL_MASK) << TD_TOTAL_SHIFT) | TD_IOC | TD_ACTIVE,
+                ((len as u32 & TD_TOTAL_MASK) << TD_TOTAL_SHIFT) | (multo << TD_MULTO_SHIFT) | TD_IOC | TD_ACTIVE,
             );
         }
     }
@@ -304,7 +312,9 @@ pub fn ep0_stall() {
 }
 
 /// Ring of `N` dTDs with one buffer each, for an isochronous endpoint. Each
-/// dTD carries one microframe's packet.
+/// dTD carries one microframe's data: one packet, or up to three for a
+/// high-bandwidth endpoint (`mult` transactions of `max_packet` bytes,
+/// `mult * max_packet <= SIZE`).
 ///
 /// The dTDs and buffers are inline and the controller holds their
 /// addresses: a started ring must never be moved (no `mem::replace`/swap).
@@ -317,8 +327,12 @@ pub struct IsoRing<const N: usize, const SIZE: usize> {
     count: usize,
     num: usize,
     dir_in: bool,
+    max_packet: u16,
+    mult: u32,
     /// dTDs that completed with an error status.
     pub errors: u32,
+    /// dTDs retired (with or without error), wrapping.
+    pub completed: u32,
 }
 
 #[repr(C, align(32))]
@@ -333,7 +347,10 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
             count: 0,
             num,
             dir_in,
+            max_packet: 0,
+            mult: 1,
             errors: 0,
+            completed: 0,
         }
     }
 
@@ -345,7 +362,13 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
     fn push(&mut self, qhs: &mut QhList, idx: usize, len: usize) {
         let bit = self.bit();
         let buf = self.bufs[idx].0.as_ptr();
-        self.tds[idx].arm(buf, len);
+        // High-bandwidth IN: send only as many packets as the data needs.
+        let multo = if self.dir_in && self.mult > 1 {
+            (len.div_ceil(self.max_packet as usize).max(1)) as u32
+        } else {
+            0
+        };
+        self.tds[idx].arm_iso(buf, len, multo);
         let td: *const Td = &self.tds[idx];
         let qh = qhs.qh(self.num, self.dir_in);
         if self.count == 0 {
@@ -364,13 +387,22 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
         self.count = 0;
     }
 
-    /// OUT: enable and queue all dTDs for packets of up to SIZE bytes.
-    pub fn start_out(&mut self, qhs: &mut QhList) {
+    /// Bytes one dTD carries at most.
+    pub fn capacity(&self) -> usize {
+        self.max_packet as usize * self.mult as usize
+    }
+
+    /// OUT: enable and queue all dTDs, each for `mult` packets of up to
+    /// `max_packet` bytes.
+    pub fn start_out(&mut self, qhs: &mut QhList, max_packet: u16, mult: u32) {
         self.stop();
-        qhs.qh(self.num, false).init(SIZE as u16, 1, false);
+        self.max_packet = max_packet;
+        self.mult = mult;
+        assert!(self.capacity() <= SIZE && (1..=3).contains(&mult));
+        qhs.qh(self.num, false).init(max_packet, mult, false);
         ep_enable(self.num, false, EpType::Isochronous);
         for i in 0..N {
-            self.push(qhs, i, SIZE);
+            self.push(qhs, i, self.capacity());
         }
     }
 
@@ -378,22 +410,28 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
     pub fn service_out(&mut self, qhs: &mut QhList, mut f: impl FnMut(&[u8])) {
         while self.count > 0 && !self.tds[self.head].active() {
             let idx = self.head;
+            self.completed = self.completed.wrapping_add(1);
             if self.tds[idx].errors() != 0 {
                 self.errors = self.errors.wrapping_add(1);
             } else {
-                let len = SIZE - self.tds[idx].remaining().min(SIZE);
+                let cap = self.capacity();
+                let len = cap - self.tds[idx].remaining().min(cap);
                 f(&self.bufs[idx].0[..len]);
             }
             self.head = (self.head + 1) % N;
             self.count -= 1;
-            self.push(qhs, idx, SIZE);
+            self.push(qhs, idx, self.capacity());
         }
     }
 
-    /// IN: enable with max packet `max_packet`, nothing queued yet.
-    pub fn start_in(&mut self, qhs: &mut QhList, max_packet: u16) {
+    /// IN: enable for `mult` packets of up to `max_packet` bytes per
+    /// microframe, nothing queued yet.
+    pub fn start_in(&mut self, qhs: &mut QhList, max_packet: u16, mult: u32) {
         self.stop();
-        qhs.qh(self.num, true).init(max_packet, 1, false);
+        self.max_packet = max_packet;
+        self.mult = mult;
+        assert!(self.capacity() <= SIZE && (1..=3).contains(&mult));
+        qhs.qh(self.num, true).init(max_packet, mult, false);
         ep_enable(self.num, true, EpType::Isochronous);
     }
 
@@ -401,6 +439,7 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
     /// `fill` (returns the packet length).
     pub fn service_in(&mut self, qhs: &mut QhList, depth: usize, mut fill: impl FnMut(&mut [u8]) -> usize) {
         while self.count > 0 && !self.tds[self.head].active() {
+            self.completed = self.completed.wrapping_add(1);
             if self.tds[self.head].errors() != 0 {
                 self.errors = self.errors.wrapping_add(1);
             }
@@ -409,7 +448,8 @@ impl<const N: usize, const SIZE: usize> IsoRing<N, SIZE> {
         }
         while self.count < depth.min(N) {
             let idx = (self.head + self.count) % N;
-            let len = fill(&mut self.bufs[idx].0).min(SIZE);
+            let cap = self.capacity();
+            let len = fill(&mut self.bufs[idx].0[..cap]).min(cap);
             self.push(qhs, idx, len);
         }
     }

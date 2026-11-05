@@ -8,7 +8,10 @@ does not grow with the run length). Once the block is found in the
 recording, every following frame must continue it exactly; a slip, drop or
 corrupted frame is reported with its time, and the checker resynchronises.
 
-  lbsoak.py [card] [secs] [rate]
+  lbsoak.py [card] [secs] [rate] [channels]
+
+channels: 2 (default), or 16 for the Rust firmware's 16-channel TDM alt
+setting (12.3 MB/s each way at 192 kHz).
 """
 import random, subprocess, sys, threading, time
 
@@ -26,10 +29,12 @@ def unity_mixer(card):
 card = sys.argv[1] if len(sys.argv) > 1 else "3"
 secs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 rate = int(sys.argv[3]) if len(sys.argv) > 3 else 192000
+channels = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 unity_mixer(card)
-FRAME = 8
+FRAME = 4 * channels
+SYNC = 256       # bytes of the block start searched for in the recording
 block = random.Random(1234).randbytes(rate * FRAME)    # 1 s
-fmt = ["-t", "raw", "-f", "S32_LE", "-c", "2", "-r", str(rate)]
+fmt = ["-t", "raw", "-f", "S32_LE", "-c", str(channels), "-r", str(rate)]
 
 rec = subprocess.Popen(["arecord", "-q", "-D", f"hw:{card},0", *fmt, "-d", str(secs + 3)],
                        stdout=subprocess.PIPE)
@@ -59,6 +64,7 @@ checked = 0      # frames checked while synced
 errors = 0
 t_frames = 0     # recorded frames, for timestamps
 buf = b""
+expect_sync = None   # recording frame where the next block start is due, after a mismatch
 last_report = time.time()
 while True:
     data = rec.stdout.read(CHUNK)
@@ -66,18 +72,27 @@ while True:
         break
     buf += data
     if not synced:
-        off = buf.find(block[:64])
+        off = buf.find(block[:SYNC])
         if off < 0:
             # Keep a frame-aligned tail that may hold the start of a match.
-            t_frames += (len(buf) - 64) // FRAME
-            buf = buf[-64:]
+            keep = (SYNC + FRAME - 1) // FRAME * FRAME
+            if len(buf) > keep:
+                t_frames += (len(buf) - keep) // FRAME
+                buf = buf[-keep:]
             continue
         if off % FRAME:
             print(f"MISALIGNED match at byte {off}: a sample was split")
         t_frames += off // FRAME
         buf = buf[off:]
         synced, pos = True, 0
-        print(f"synced at {t_frames / rate:.3f} s")
+        msg = f"synced at {t_frames / rate:.3f} s"
+        if expect_sync is not None:
+            # Frames lost (<0) or added (>0) between the mismatch and here,
+            # modulo the 1 s block.
+            slip = (t_frames - expect_sync + rate // 2) % rate - rate // 2
+            msg += f", slip {slip:+d} frames"
+            expect_sync = None
+        print(msg, flush=True)
     # Compare as much of buf as possible, wrapping around the block.
     i = 0
     while len(buf) - i >= FRAME:
@@ -93,7 +108,11 @@ while True:
                 synced = None
                 break
             errors += 1
-            print(f"MISMATCH at {at:.3f} s (frame {checked + bad // FRAME} of the stream), resync")
+            got = buf[i + bad:i + bad + FRAME]
+            zero = got == bytes(FRAME)
+            print(f"MISMATCH at {at:.3f} s (frame {checked + bad // FRAME} of the stream), "
+                  f"got {'zeros' if zero else got[:8].hex()}, resync", flush=True)
+            expect_sync = t_frames + (i + bad) // FRAME + (len(block) - (pos + bad)) // FRAME
             checked += bad // FRAME
             t_frames += (i + bad) // FRAME
             buf = buf[i + bad + FRAME:]

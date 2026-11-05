@@ -166,9 +166,13 @@ class Dev:
         return self.control(0x41, req, value, ITF_VENDOR)
 
     def stats(self):
-        v = struct.unpack("<II5I2iHH", self.vendor_in(0x03, 40))
+        raw = self.vendor_in(0x03, 60)
+        v = struct.unpack("<II5I2iHH", raw[:40])
+        # Protocol 0.3 (60 bytes): USB dTD errors and missed microframes.
+        u = struct.unpack("<5I", raw[40:60]) if len(raw) >= 60 else (0,) * 5
         return dict(rate=v[0], fb=v[1], underruns=v[2], rec_overruns=v[3], rec_drops=v[4],
-                    tx_err=v[5], rx_err=v[6], lead=(v[7], v[8]), flags=v[9])
+                    tx_err=v[5], rx_err=v[6], lead=(v[7], v[8]), flags=v[9],
+                    usb_err=u[0:3], missed=u[3:5])
 
     def alive(self):
         try:
@@ -344,7 +348,8 @@ def report(name, ok, msg):
 
 
 def clean(st):
-    return st["underruns"] == 0 and st["rec_overruns"] == 0 and st["tx_err"] == 0 and st["rx_err"] == 0
+    return (st["underruns"] == 0 and st["rec_overruns"] == 0 and st["tx_err"] == 0 and st["rx_err"] == 0
+            and st["usb_err"] == (0, 0, 0) and st["missed"] == (0, 0))
 
 
 def summary(s, st):
@@ -355,7 +360,8 @@ def summary(s, st):
     hz = [v * 8000 / 65536 for v in s.fb_values[len(s.fb_values) // 2:]] or [0]
     return (f"{s.frames_in} frames in, {len(s.disc)} discontinuities, pkt errors {s.packet_errors}, "
             f"fb {sum(hz) / len(hz):.2f} Hz, underruns {st['underruns']} overruns {st['rec_overruns']} "
-            f"fifo {st['tx_err']}/{st['rx_err']} lead {st['lead'][0]}..{st['lead'][1]}")
+            f"fifo {st['tx_err']}/{st['rx_err']} lead {st['lead'][0]}..{st['lead'][1]} "
+            f"usb err {'/'.join(map(str, st['usb_err']))} missed {'/'.join(map(str, st['missed']))}")
 
 
 RATE = int(os.environ.get("RATE", "192000"))
@@ -481,7 +487,7 @@ def t_control(dev):
     expect("SET_CUR to clock with FU mute size", lambda: dev.control(0x21, 1, 0x0100, 0x0400, b"\x01"), "stall")
     expect("class request to itf 1", lambda: dev.control(0xA1, 1, 0x0100, 0x0001, length=4), "stall")
     # usbfs refuses wLength > PAGE_SIZE (EINVAL), so 4096 is the largest testable.
-    expect("GET_DESCRIPTOR config, wLength 4096", lambda: dev.control(0x80, 6, 0x0200, 0, length=4096), 281)
+    expect("GET_DESCRIPTOR config, wLength 4096", lambda: dev.control(0x80, 6, 0x0200, 0, length=4096), 380)
     expect("GET_DESCRIPTOR config, wLength 9", lambda: dev.control(0x80, 6, 0x0200, 0, length=9), 9)
     expect("GET_DESCRIPTOR string 200", lambda: dev.control(0x80, 6, 0x03C8, 0x0409, length=255), "stall")
     expect("GET_DESCRIPTOR type 0x0F (BOS)", lambda: dev.control(0x80, 6, 0x0F00, 0, length=255), "stall")
@@ -601,8 +607,18 @@ def t_gain(dev):
                   summary(s, st)) and ok
 
 
+def t_gap(dev):
+    """The host stops submitting for 50 ms mid-stream: its URB queue (4 ms)
+    runs dry and it skips microframes on both data endpoints. The device's
+    missed-microframe counters must see it (about 46 ms x 8)."""
+    s, st = run_stream(dev, RATE, 4, hooks=[(2.0, lambda s: time.sleep(0.05))])
+    out, inp = st["missed"]
+    ok = all(250 <= m <= 450 for m in (out, inp)) and st["usb_err"] == (0, 0, 0)
+    return report("gap", ok, f"missed out {out} in {inp} (want about 370 each); " + summary(s, st))
+
+
 TESTS = dict(stream=t_stream, ratechange=t_ratechange, halt=t_halt, oddsize=t_oddsize,
-             altstorm=t_altstorm, gain=t_gain, control=t_control)
+             altstorm=t_altstorm, gain=t_gain, gap=t_gap, control=t_control)
 
 
 def main():
@@ -622,7 +638,26 @@ def main():
             fails += not TESTS[n](dev)
     finally:
         dev.close()
+        settle_card()
     sys.exit(1 if fails else 0)
+
+
+def settle_card():
+    """Wait for snd-usb-audio to bring the card back, then for the host
+    mixer: PipeWire/WirePlumber opens a new card and sets its own volume a
+    moment later, which would undo a unity mixer set by the next test
+    (loopback.py) and make it fail."""
+    import glob
+    end = time.monotonic() + 5
+    while time.monotonic() < end:
+        for f in glob.glob("/proc/asound/card*/usbid"):
+            try:
+                if open(f).read().strip() == "cafe:0ac2":
+                    time.sleep(3)
+                    return
+            except OSError:
+                pass
+        time.sleep(0.1)
 
 
 if __name__ == "__main__":

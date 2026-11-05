@@ -5,11 +5,18 @@
 //! shifted out is sampled together with the microframe number (FRINDEX).
 //! Feedback is the difference over a sliding window of about one second:
 //!
-//!   fb (16.16 samples per microframe) = d_words / 2 * 65536 / d_microframes
+//!   fb (16.16 samples per microframe) = d_words / channels * 65536 / d_microframes
 //!
 //! The window slides one 2 ms step at a time, so consecutive values do not
 //! share quantisation: the host's running total of requested samples follows
 //! the device's consumed total within one window.
+//!
+//! The division's remainder is carried to the next value (error diffusion):
+//! at 16 channels, d_words / 16 * 65536 / 8192 = d_words / 2, and plain
+//! truncation lost half an LSB whenever d_words was odd. That bias (about
+//! 0.03 Hz at 192 kHz) made the host send one frame a minute too few, and
+//! the playback lead fell 120 frames in a 2 h soak. In stereo the division
+//! is exact (d_words * 4) for a full window.
 //!
 //! Startup: the window grows from 16 ms to 1024 ms after reset; until 16 ms
 //! of history exist the nominal value is sent.
@@ -35,6 +42,10 @@ pub struct Feedback {
     reset_req: bool,
     nominal: u32,
     value: u32,
+    /// Words per frame on the SAI.
+    channels: u32,
+    /// Remainder carried between values, as a 0.32 fraction of an LSB.
+    frac: u32,
 }
 
 /// Nominal feedback for a rate, 16.16 samples per microframe.
@@ -52,13 +63,17 @@ impl Feedback {
             reset_req: true,
             nominal: nominal(rate),
             value: nominal(rate),
+            channels: 2,
+            frac: 0,
         }
     }
 
-    /// Restart measurement (stream start, rate change).
-    pub fn reset(&mut self, rate: u32) {
+    /// Restart measurement (stream start, rate or format change).
+    pub fn reset(&mut self, rate: u32, channels: usize) {
+        self.channels = channels as u32;
         self.nominal = nominal(rate);
         self.value = self.nominal;
+        self.frac = 0;
         self.reset_req = true;
     }
 
@@ -93,7 +108,11 @@ impl Feedback {
             let old = self.hist[if self.n_hist < HIST { 0 } else { self.head }];
             let d_uf = uf.wrapping_sub(old.uf as u32) & UF_MASK;
             if d_uf >= MIN_WIN_UF {
-                let fb = ((words.wrapping_sub(old.words) as u64) << 15) / d_uf as u64;
+                let num = (words.wrapping_sub(old.words) as u64) << 16;
+                let den = self.channels as u64 * d_uf as u64;
+                let (frac, carry) = self.frac.overflowing_add(((num % den << 32) / den) as u32);
+                self.frac = frac;
+                let fb = num / den + carry as u64;
                 let lim = self.nominal as u64 * CLAMP_PPM / 1_000_000;
                 let fb = fb.clamp(self.nominal as u64 - lim, self.nominal as u64 + lim);
                 self.value = fb as u32;

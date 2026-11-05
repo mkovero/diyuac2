@@ -55,7 +55,7 @@ fn main() -> ! {
         sda: pads.gpio_ad_b1.p15,
     });
     let rate = audio::DEFAULT_RATE;
-    if !audio_hw::start(rate) {
+    if !audio_hw::start(rate, 2) {
         panic!();
     }
     let mut codec = codec::Codec::new(i2c);

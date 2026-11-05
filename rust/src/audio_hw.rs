@@ -7,15 +7,26 @@
 //! Clocking: audio PLL (PLL4) -> SAI1 clock root /4 /N = 256 fs, output on
 //! the SAI1_MCLK pad (codec SYSCLK). PLL4 runs at 786.432 MHz for the
 //! 48 kHz family and 722.5344 MHz for the 44.1 kHz family; it is
-//! reprogrammed when a rate change crosses families. SAI1 TX is the I2S master (BCLK = 64 fs, FS = fs), RX is
-//! synchronous to TX. The audio clock comes from the 24 MHz crystal and is
-//! independent of the USB host clock.
+//! reprogrammed when a rate change crosses families. SAI1 TX is the
+//! master, RX is synchronous to TX. The audio clock comes from the 24 MHz
+//! crystal and is independent of the USB host clock.
+//!
+//! Two formats ([`start`]):
+//!
+//! - 2 channels: I2S on data line 0 (BCLK = 64 fs), the codec format.
+//! - 16 channels (soak/debug): TDM, 4 data lines x 4 slots of 32 bits,
+//!   BCLK = 128 fs (24.576 MHz at 192 kHz, MCLK / 2). FIFO combine mode
+//!   spreads the DMA's single-register writes (reads) over the four line
+//!   FIFOs, so ring word 4 * slot + line is line `line`, slot `slot`. Only
+//!   line 0 has pads (TX to the codec DAC, RX from the codec ADC), and the
+//!   codec cannot decode the 4-slot frame: this format is for the debug
+//!   loopback, which reads the TX ring back.
 //!
 //! Data: eDMA channel 0 loops over the TX ring into TDR0, channel 1 loops
 //! from RDR0 into the RX ring, both forever (SLAST / DLAST rewind the
 //! address at major loop end). A major-loop interrupt counts ring wraps;
 //! the position within the ring comes from CITER. Rings are in DTCM (not
-//! cached, DMA accessible).
+//! cached, DMA accessible), [`RING_WORDS`] each in either format.
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -28,9 +39,68 @@ use hal::ccm;
 use hal::iomuxc::{self, Config, DriveStrength, OpenDrain, PullKeeper, Speed};
 use ral::Interrupt as interrupt;
 
-pub const CHANNELS: usize = 2;
-pub const RING_FRAMES: usize = 2048;
-const RING_WORDS: usize = RING_FRAMES * CHANNELS;
+/// Ring size in 32-bit words: 8192 frames of 2 channels, 1024 of 16.
+pub const RING_WORDS: usize = 16384;
+
+/// SAI and DMA settings of one format.
+struct Format {
+    channels: usize,
+    tcr2: u32,
+    rcr2: u32,
+    xcr3: u32,
+    tcr4: u32,
+    rcr4: u32,
+    /// Data lines (FIFOs) in use.
+    lines: usize,
+}
+
+// SAI register values for 2 channels as programmed by the C firmware via
+// the MCUXpresso SAI driver: classic I2S, 32-bit words, stereo, data line
+// 0, master.
+//   TCR2: async, MCLK1, BCLK polarity active low, BCLK output, DIV 1
+//         (BCLK = MCLK / 4 = 64 fs); RCR2 synchronous to the transmitter.
+//   XCR3: data line 0 enabled.
+//   TCR4: FIFO continue on error, 2 words per frame, sync width 32 bits,
+//         MSB first, frame sync one bit early, active low, generated
+//         internally, CHMOD output mode; RCR4 without CHMOD.
+// 16 channels: DIV 0 (BCLK = MCLK / 2 = 128 fs), lines 0..3, 4 words per
+// frame, FIFO combine on software writes (TX) / reads (RX).
+const FORMAT_2CH: Format = Format {
+    channels: 2,
+    tcr2: 0x0700_0001,
+    rcr2: 0x4700_0001,
+    xcr3: 0x0001_0000,
+    tcr4: 0x1001_1F3B,
+    rcr4: 0x1001_1F1B,
+    lines: 1,
+};
+const XCR4_FCOMB_SOFTWARE: u32 = 0b10 << 26;
+const FORMAT_16CH: Format = Format {
+    channels: 16,
+    tcr2: 0x0700_0000,
+    rcr2: 0x4700_0000,
+    xcr3: 0x000F_0000,
+    tcr4: 0x1003_1F3B | XCR4_FCOMB_SOFTWARE,
+    rcr4: 0x1003_1F1B | XCR4_FCOMB_SOFTWARE,
+    lines: 4,
+};
+
+fn format(channels: usize) -> Option<&'static Format> {
+    [&FORMAT_2CH, &FORMAT_16CH].into_iter().find(|f| f.channels == channels)
+}
+
+/// The format in effect: channels per frame and data lines.
+static CHANNELS: AtomicU32 = AtomicU32::new(2);
+static LINES: AtomicU32 = AtomicU32::new(1);
+
+pub fn channels() -> usize {
+    CHANNELS.load(Ordering::Relaxed) as usize
+}
+
+/// Words per DMA request: one per data line.
+fn minor_words() -> u32 {
+    LINES.load(Ordering::Relaxed)
+}
 
 const TX_CH: usize = 0;
 const RX_CH: usize = 1;
@@ -66,23 +136,8 @@ fn pll4_set(f: &Family) {
 const LPI2C_DIVIDER: u32 = 6;
 pub const LPI2C_CLK_HZ: u32 = 60_000_000 / LPI2C_DIVIDER;
 
-// SAI register values (as programmed by the C firmware via the MCUXpresso
-// SAI driver: classic I2S, 32-bit words, stereo, channel 0, master).
 /// TCR1/RCR1: FIFO watermark 16 words.
 const XCR1: u32 = 0x10;
-/// TCR2: async, MCLK1, BCLK polarity active low, BCLK output, DIV 1
-/// (BCLK = MCLK / 4 = 64 fs).
-const TCR2: u32 = 0x0700_0001;
-/// RCR2: as TCR2, synchronous to the transmitter.
-const RCR2: u32 = 0x4700_0001;
-/// TCR3/RCR3: data channel 0 enabled.
-const XCR3: u32 = 0x0001_0000;
-/// TCR4: FIFO continue on error, 2 words per frame, sync width 32 bits,
-/// MSB first, frame sync one bit early, active low, generated internally,
-/// CHMOD output mode.
-const TCR4: u32 = 0x1001_1F3B;
-/// RCR4: as TCR4 without CHMOD.
-const RCR4: u32 = 0x1001_1F1B;
 /// TCR5/RCR5: word N width 32, word 0 width 32, first bit shifted 31.
 const XCR5: u32 = 0x1F1F_1F00;
 
@@ -144,22 +199,24 @@ fn DMA1_DMA17() {
     cortex_m::asm::dsb();
 }
 
-/// Total words moved by a ring channel. Race-free against the wrap
-/// interrupt (which preempts every caller): retry if the wrap count
-/// changed; if the major loop completed but its interrupt is still pending,
-/// account for it here.
-fn dma_words(ch: usize, wraps: &AtomicU32) -> u32 {
+/// Total words moved by a ring channel since [`start`] (64 bits: at 16
+/// channels and 192 kHz a 32-bit count would wrap every 23 minutes).
+/// Race-free against the wrap interrupt (which preempts every caller):
+/// retry if the wrap count changed; if the major loop completed but its
+/// interrupt is still pending, account for it here.
+fn dma_words(ch: usize, wraps: &AtomicU32) -> u64 {
     let dma = dma();
+    let minor = minor_words();
     let (w, pos, pending) = loop {
         let w = wraps.load(Ordering::SeqCst);
-        let pos = RING_WORDS as u32 - dma.TCD[ch].TCD_CITER_ELINKNO.read() as u32;
+        let pos = RING_WORDS as u32 - dma.TCD[ch].TCD_CITER_ELINKNO.read() as u32 * minor;
         let pending = ral::read_reg!(ral::dma, dma, INT) & (1 << ch) != 0;
         if w == wraps.load(Ordering::SeqCst) {
             break (w, pos, pending);
         }
     };
     let w = if pending && pos < RING_WORDS as u32 / 2 { w + 1 } else { w };
-    w.wrapping_mul(RING_WORDS as u32).wrapping_add(pos)
+    w as u64 * RING_WORDS as u64 + pos as u64
 }
 
 /// Pads used by the audio interface.
@@ -249,7 +306,9 @@ pub fn init(mut pins: Pins) -> I2c {
     i2c
 }
 
-fn dma_ring_setup(ch: usize, src: u32, soff: u16, slast: u32, dst: u32, doff: u16, dlast: u32, source: u32) {
+/// A DMA channel looping over a ring: `minor` words per request.
+#[allow(clippy::too_many_arguments)]
+fn dma_ring_setup(ch: usize, minor: u32, src: u32, soff: u16, slast: u32, dst: u32, doff: u16, dlast: u32, source: u32) {
     let dma = dma();
     let mux = unsafe { ral::dmamux::DMAMUX::instance() };
     ral::write_reg!(ral::dma, dma, CERQ, ch as u8);
@@ -260,12 +319,13 @@ fn dma_ring_setup(ch: usize, src: u32, soff: u16, slast: u32, dst: u32, doff: u1
     tcd.TCD_SADDR.write(src);
     tcd.TCD_SOFF.write(soff);
     tcd.TCD_ATTR.write(DMA_ATTR_32BIT);
-    tcd.TCD_NBYTES_MLNO.write(4);
+    tcd.TCD_NBYTES_MLNO.write(4 * minor);
     tcd.TCD_SLAST.write(slast);
     tcd.TCD_DADDR.write(dst);
     tcd.TCD_DOFF.write(doff);
-    tcd.TCD_CITER_ELINKNO.write(RING_WORDS as u16);
-    tcd.TCD_BITER_ELINKNO.write(RING_WORDS as u16);
+    let iter = (RING_WORDS as u32 / minor) as u16;
+    tcd.TCD_CITER_ELINKNO.write(iter);
+    tcd.TCD_BITER_ELINKNO.write(iter);
     tcd.TCD_DLASTSGA.write(dlast);
     tcd.TCD_CSR.write(DMA_CSR_INTMAJOR);
     ral::write_reg!(ral::dma, dma, CINT, ch as u8);
@@ -306,9 +366,10 @@ pub fn stop() {
     ral::write_reg!(ral::dma, dma, CERQ, RX_CH as u8);
 }
 
-/// (Re)start the audio interface at `rate`. MCLK runs from here on.
-pub fn start(rate: u32) -> bool {
-    let Some((family, div)) = rate_divider(rate) else {
+/// (Re)start the audio interface at `rate` with `channels` per frame (2 or
+/// 16). MCLK runs from here on.
+pub fn start(rate: u32, channels: usize) -> bool {
+    let (Some((family, div)), Some(fmt)) = (rate_divider(rate), format(channels)) else {
         return false;
     };
     stop();
@@ -333,15 +394,15 @@ pub fn start(rate: u32) -> bool {
     ral::write_reg!(ral::sai, sai, RCSR, CSR_FR);
 
     ral::write_reg!(ral::sai, sai, TCR1, XCR1);
-    ral::write_reg!(ral::sai, sai, TCR2, TCR2);
-    ral::write_reg!(ral::sai, sai, TCR3, XCR3);
-    ral::write_reg!(ral::sai, sai, TCR4, TCR4);
+    ral::write_reg!(ral::sai, sai, TCR2, fmt.tcr2);
+    ral::write_reg!(ral::sai, sai, TCR3, fmt.xcr3);
+    ral::write_reg!(ral::sai, sai, TCR4, fmt.tcr4);
     ral::write_reg!(ral::sai, sai, TCR5, XCR5);
     ral::write_reg!(ral::sai, sai, TMR, 0);
     ral::write_reg!(ral::sai, sai, RCR1, XCR1);
-    ral::write_reg!(ral::sai, sai, RCR2, RCR2);
-    ral::write_reg!(ral::sai, sai, RCR3, XCR3);
-    ral::write_reg!(ral::sai, sai, RCR4, RCR4);
+    ral::write_reg!(ral::sai, sai, RCR2, fmt.rcr2);
+    ral::write_reg!(ral::sai, sai, RCR3, fmt.xcr3);
+    ral::write_reg!(ral::sai, sai, RCR4, fmt.rcr4);
     ral::write_reg!(ral::sai, sai, RCR5, XCR5);
     ral::write_reg!(ral::sai, sai, RMR, 0);
 
@@ -351,12 +412,15 @@ pub fn start(rate: u32) -> bool {
     rx.0.fill(0);
     TX_WRAPS.store(0, Ordering::SeqCst);
     RX_WRAPS.store(0, Ordering::SeqCst);
+    CHANNELS.store(fmt.channels as u32, Ordering::Relaxed);
+    LINES.store(fmt.lines as u32, Ordering::Relaxed);
+    let minor = fmt.lines as u32;
 
     let ring_bytes = (RING_WORDS * 4) as u32;
     let tdr0 = &sai.TDR[0] as *const _ as u32;
     let rdr0 = &sai.RDR[0] as *const _ as u32;
-    dma_ring_setup(TX_CH, tx.0.as_ptr() as u32, 4, ring_bytes.wrapping_neg(), tdr0, 0, 0, DMAMUX_SAI1_TX);
-    dma_ring_setup(RX_CH, rdr0, 0, 0, rx.0.as_ptr() as u32, 4, ring_bytes.wrapping_neg(), DMAMUX_SAI1_RX);
+    dma_ring_setup(TX_CH, minor, tx.0.as_ptr() as u32, 4, ring_bytes.wrapping_neg(), tdr0, 0, 0, DMAMUX_SAI1_TX);
+    dma_ring_setup(RX_CH, minor, rdr0, 0, 0, rx.0.as_ptr() as u32, 4, ring_bytes.wrapping_neg(), DMAMUX_SAI1_RX);
 
     let dma = dma();
     ral::write_reg!(ral::dma, dma, SERQ, TX_CH as u8);
@@ -364,16 +428,22 @@ pub fn start(rate: u32) -> bool {
     ral::write_reg!(ral::sai, sai, TCSR, CSR_FRDE);
     ral::write_reg!(ral::sai, sai, RCSR, CSR_FRDE);
 
-    // No TX FIFO prefill here: the DMA does not fill the FIFO while the
-    // transmitter is disabled (a wait for it timed out after 6.4 ms in the
-    // USB ISR). It fills within the first frame once TE is set.
+    // The DMA does not fill the FIFO while the transmitter is disabled (a
+    // wait for it timed out after 6.4 ms in the USB ISR); it fills within
+    // the first frame once TE is set. One zero frame written here keeps
+    // the four FIFOs of the TDM format from underrunning in that frame
+    // (one FIFO error per start otherwise). It shifts the output by one
+    // frame; tx_words_played() counts it as FIFO fill.
+    for _ in 0..fmt.channels {
+        ral::write_reg!(ral::sai, sai, TDR[0], 0);
+    }
     // The synchronous receiver starts with the transmitter's first frame.
     ral::write_reg!(ral::sai, sai, RCSR, CSR_FRDE | CSR_TE | CSR_BCE);
     ral::write_reg!(ral::sai, sai, TCSR, CSR_FRDE | CSR_TE | CSR_BCE);
     true
 }
 
-/// TX ring, frames interleaved L R (32-bit slots).
+/// TX ring, frames of [`channels`] interleaved 32-bit words.
 pub fn tx_ring() -> &'static mut [u32; RING_WORDS] {
     // SAFETY: the USB ISR is the only writer; the DMA only reads.
     unsafe { &mut (*addr_of_mut!(TX_RING)).0 }
@@ -383,26 +453,35 @@ pub fn rx_ring() -> &'static [u32; RING_WORDS] {
     unsafe { &(*addr_of_mut!(RX_RING)).0 }
 }
 
-/// Frames the TX DMA has fetched from the ring (free-running).
+/// Frames the TX DMA has fetched from the ring (free-running, mod 2^32).
 pub fn tx_frames_fetched() -> u32 {
-    dma_words(TX_CH, &TX_WRAPS) / CHANNELS as u32
+    (dma_words(TX_CH, &TX_WRAPS) >> channels().trailing_zeros()) as u32
 }
 
-/// Frames the RX DMA has written into the ring (free-running).
+/// Frames the RX DMA has written into the ring (free-running, mod 2^32).
 pub fn rx_frames_written() -> u32 {
-    dma_words(RX_CH, &RX_WRAPS) / CHANNELS as u32
+    (dma_words(RX_CH, &RX_WRAPS) >> channels().trailing_zeros()) as u32
 }
 
-/// Words the SAI transmitter has shifted out: DMA words minus TX FIFO fill.
+/// Words the SAI transmitter has shifted out: DMA words minus the fill of
+/// the TX FIFOs in use (mod 2^32).
 pub fn tx_words_played() -> u32 {
     let sai = sai();
+    let lines = minor_words() as usize;
+    let read = || {
+        let mut f = [0u32; 4];
+        for (i, x) in f.iter_mut().enumerate().take(lines) {
+            *x = ral::read_reg!(ral::sai, sai, TFR[i]);
+        }
+        f
+    };
     loop {
-        let f1 = ral::read_reg!(ral::sai, sai, TFR[0]);
-        let d = dma_words(TX_CH, &TX_WRAPS);
-        let f2 = ral::read_reg!(ral::sai, sai, TFR[0]);
-        // A DMA write between the reads changes the FIFO write pointer: retry.
-        if (f1 ^ f2) & (FIFO_PTR_MASK << 16) == 0 {
-            return d.wrapping_sub(tx_fifo_fill(f2));
+        let f1 = read();
+        let d = dma_words(TX_CH, &TX_WRAPS) as u32;
+        let f2 = read();
+        // A DMA write between the reads changes a FIFO write pointer: retry.
+        if f1.iter().zip(&f2).all(|(a, b)| (a ^ b) & (FIFO_PTR_MASK << 16) == 0) {
+            return d.wrapping_sub(f2.iter().map(|&f| tx_fifo_fill(f)).sum::<u32>());
         }
     }
 }
